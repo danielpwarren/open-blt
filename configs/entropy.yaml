@@ -1,0 +1,22 @@
+# Base configuration
+model:
+  dim: 768
+  n_layers: 6
+  n_heads: 8
+  max_seqlen: 2048
+  vocab_size: 256  # Byte-level vocab
+  attn_impl: "xformers"
+
+data:
+  root_dir: "./pile"  # Path to your Pile data
+  seq_len: 2048
+  batch_size: 4
+
+training:
+  lr: 1e-4
+  warmup_steps: 1000
+  max_steps: 100000
+
+logging:
+  wandb_project: "blt-entropy"
+  log_interval: 100
