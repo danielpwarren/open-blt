@@ -1,0 +1,35 @@
+seed: 42
+name: "blt-entropy-debug"
+dump_dir: "./checkpoints"
+training:
+  total_steps: 100000
+  val_interval: 200            # How often to run a validation-generation step
+model:
+  dim: 768
+  n_layers: 14
+  n_heads: 12
+  vocab_size: 260              # 256 bytes + reserved tokens (BOS/EOS and some extra)
+  ffn_dim_multiplier: 1.0
+  sliding_window: 512
+  attn_bias_type: "local_block_causal"
+  attn_impl: "xformers"
+optim:
+  lr: 4e-4
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  clip: 10.0
+  warmup: 500
+  lr_min_ratio: 0.1
+data:
+  file: "shakespeare.txt"
+  seq_len: 8192
+  batch_size: 2
+  workers: 4
+logging:
+  wandb_project: "open-blt"
+  log_freq: 10
+checkpoint:
+  dump:
+    every: 500
+    keep: 3

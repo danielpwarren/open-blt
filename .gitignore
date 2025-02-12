@@ -173,3 +173,7 @@ cython_debug/
 .vscode
 .DS_Store
 wandb
+pile
+checkpoints
+*.txt
+!requirements.txt

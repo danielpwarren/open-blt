@@ -4,6 +4,36 @@
 
 This project aims to implement Meta’s **Byte Latent Transformer (BLT)**, a novel approach that eliminates tokenization by encoding byte sequences as latent vectors for transformer input. This method enhances scalability and removes the dependence on a fixed vocabulary. The study will evaluate BLT’s performance on small-scale architectures and explore potential applications beyond text processing.  
 
+## Running the Code
+
+To run the code, follow these steps:
+1. Clone the repository:
+```bash
+git clone https://github.com/danielpwarren/open-blt
+cd open-blt
+```
+
+2. Activate the virtual environment:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+3. Install the required packages:
+```bash
+pip install -r requirements.txt
+```
+
+4. Run the main script:
+```bash
+python -m blt.train
+```
+
+## Run logging
+
+This project loggs runs using WandB. To view current and past runs, visit the [WandB project page](https://wandb.ai/danielpwarren/open-blt).
+
+
 ## Research Plan and Timeline  
 
 ### Phase 1: Preparation (Weeks 5-6)  
