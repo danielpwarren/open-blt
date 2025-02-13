@@ -31,7 +31,7 @@ python -m blt.train
 
 ## Run logging
 
-This project loggs runs using WandB. To view current and past runs, visit the [WandB project page](https://wandb.ai/danielpwarren/open-blt).
+This project logs training runs using WandB. To view current and past runs, visit the [WandB project page](https://wandb.ai/danielpwarren/open-blt).
 
 
 ## Research Plan and Timeline  

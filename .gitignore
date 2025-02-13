@@ -177,3 +177,4 @@ pile
 checkpoints
 *.txt
 !requirements.txt
+*.bin

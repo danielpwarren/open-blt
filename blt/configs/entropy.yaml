@@ -1,13 +1,13 @@
 seed: 42
-name: "blt-entropy-debug"
+name: "blt-entropy-pile"
 dump_dir: "./checkpoints"
 training:
   total_steps: 100000
   val_interval: 200            # How often to run a validation-generation step
 model:
-  dim: 768
-  n_layers: 14
-  n_heads: 12
+  dim: 512
+  n_layers: 8
+  n_heads: 4
   vocab_size: 260              # 256 bytes + reserved tokens (BOS/EOS and some extra)
   ffn_dim_multiplier: 1.0
   sliding_window: 512
@@ -21,14 +21,15 @@ optim:
   clip: 10.0
   warmup: 500
   lr_min_ratio: 0.1
+  enable_dynamo: false
 data:
-  file: "shakespeare.txt"
+  file: "pile.bin"
   seq_len: 8192
-  batch_size: 2
-  workers: 4
+  batch_size: 8
+  workers: 16
 logging:
   wandb_project: "open-blt"
-  log_freq: 10
+  log_freq: 1
 checkpoint:
   dump:
     every: 500
