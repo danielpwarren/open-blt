@@ -93,6 +93,30 @@ def generate_text_sample(model, prompt, max_new_tokens, temperature):
     return generated
 
 
+def compute_text_entropy(model, text, config, bos_id=257, eos_id=258):
+    """
+    Computes the average cross-entropy (converted to bits) for the given text.
+    Returns bits-per-byte (bpb) for the sentence.
+    """
+    model.eval()
+    with pt.no_grad():
+        # Tokenize text: [BOS] + list(text.encode('utf-8')) + [EOS]
+        token_list = [bos_id] + list(text.encode("utf-8")) + [eos_id]
+        tokens = pt.tensor(token_list, dtype=pt.long).unsqueeze(0).cuda()
+        input_tokens = tokens[:, :-1]
+        target_tokens = tokens[:, 1:]
+        logits = model(input_tokens)  # shape: [1, seq_len, vocab_size]
+        loss = F.cross_entropy(
+            logits.view(-1, config.model.vocab_size),
+            target_tokens.view(-1),
+            reduction="mean",
+        )
+        # Convert from nats to bits
+        bpb = loss.item() / math.log(2)
+    model.train()
+    return bpb
+
+
 # -------------------------------
 # Main training loop
 # -------------------------------
@@ -154,8 +178,26 @@ def main():
         lr_min_ratio=config.optim.lr_min_ratio,
     )
 
+    # -------------------------------
+    # Resume from checkpoint if provided
+    # -------------------------------
+    if config.checkpoint.resume_from:
+        if os.path.isfile(config.checkpoint.resume_from):
+            checkpoint = pt.load(config.checkpoint.resume_from)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            step = checkpoint["step"]
+            print(f"Resumed training from checkpoint at step {step}.")
+        else:
+            print(
+                f"Checkpoint file {config.checkpoint.resume_from} not found. Starting fresh."
+            )
+            step = 0
+    else:
+        step = 0
+
     model.train()
-    step = 0
     log_freq = config.logging.log_freq
     val_interval = config.training.val_interval
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -256,6 +298,9 @@ def main():
                 )
 
             if step % val_interval == 0:
+                # ---------------------------
+                # 1) Log text generation samples
+                # ---------------------------
                 sample_text_table = wandb.Table(
                     columns=["id", "temperature", "token_ids", "response"]
                 )
@@ -274,7 +319,14 @@ def main():
                         sample_text_table.add_data(
                             uid, temp, gen_tokens[0].tolist(), response
                         )
-                wandb.log({"samples": sample_text_table})
+                wandb.log({"samples": sample_text_table}, step=step)
+
+                # ---------------------------
+                # 2) Compute & log entropy for a fixed sentence
+                # ---------------------------
+                test_sentence = "Daenerys Targeryen is in Game of Thrones, a fantasy epic by George R.R. Martin."
+                entropy_bpb = compute_text_entropy(model, test_sentence, config)
+                wandb.log({"val/entropy_daenerys_sentence_bpb": entropy_bpb}, step=step)
 
             if step >= config.training.total_steps:
                 break
