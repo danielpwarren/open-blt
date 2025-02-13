@@ -274,7 +274,7 @@ def main():
                         sample_text_table.add_data(
                             uid, temp, gen_tokens[0].tolist(), response
                         )
-                wandb.log({"samples": sample_text_table, "val_step": step})
+                wandb.log({"samples": sample_text_table})
 
             if step >= config.training.total_steps:
                 break
