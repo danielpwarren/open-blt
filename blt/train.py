@@ -1,14 +1,16 @@
 import argparse
 import math
 import os
+import random
 import time
 
+import numpy as np
 import torch as pt
 import torch.nn.functional as F
+import wandb
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-import wandb
 from blt.data.binary_dataset import BinaryDataset
 from blt.model.entropy import EntropyModel
 from blt.model.utils import get_num_flop_per_token
@@ -16,9 +18,7 @@ from blt.utils.logging import init_wandb, log_metrics
 from blt.utils.optim import build_optimizer, get_cosine_schedule
 
 
-# -------------------------------
 # Helper functions
-# -------------------------------
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -53,15 +53,20 @@ def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, keep):
                 print(f"Removed old checkpoint {ckpt}")
 
 
-# For generation, we update text_to_tokens to leave byte values unchanged.
 def text_to_tokens(text, bos_id=257, eos_id=258):
+    """
+    Convert text into a list of raw byte tokens, prepended by BOS.
+    Note: We do NOT append EOS for generation prompts.
+    """
     token_list = list(text.encode("utf-8"))
-    return [bos_id] + token_list  # (EOS is not appended for generation)
+    return [bos_id] + token_list
 
 
 def decode_tokens(tokens):
+    """
+    Convert a list of tokens (ints) back to UTF-8 text, omitting BOS/EOS.
+    """
     token_list = tokens.tolist() if isinstance(tokens, pt.Tensor) else tokens
-    # Remove our special tokens (bos=257, eos=258) before decoding.
     filtered = [t for t in token_list if t not in (257, 258)]
     try:
         return bytes(filtered).decode("utf-8", errors="replace")
@@ -78,11 +83,11 @@ def generate_text_sample(model, prompt, max_new_tokens, temperature):
     if prompt.size(1) == 0:
         prompt = pt.tensor([[257]], dtype=pt.long).cuda()
     generated = prompt.clone()
-    forced_tokens = 128  # force continuation for the first 128 tokens
+    forced_tokens = 128
     with pt.no_grad():
         for i in range(max_new_tokens):
-            logits = model(generated)  # shape: [1, cur_seq, vocab_size]
-            next_logits = logits[0, -1]  # last token's logits
+            logits = model(generated)
+            next_logits = logits[0, -1]
             scaled_logits = next_logits / temperature
             probabilities = pt.softmax(scaled_logits, dim=-1)
             next_token = pt.multinomial(probabilities, num_samples=1).unsqueeze(0)
@@ -93,33 +98,21 @@ def generate_text_sample(model, prompt, max_new_tokens, temperature):
     return generated
 
 
-def compute_text_entropy(model, text, config, bos_id=257, eos_id=258):
+def seed_everything(seed):
     """
-    Computes the average cross-entropy (converted to bits) for the given text.
-    Returns bits-per-byte (bpb) for the sentence.
+    Ensures reproducible behavior by setting seeds for python, numpy, and torch.
+    Disables CUDA benchmarking to ensure deterministic behavior where possible.
     """
-    model.eval()
-    with pt.no_grad():
-        # Tokenize text: [BOS] + list(text.encode('utf-8')) + [EOS]
-        token_list = [bos_id] + list(text.encode("utf-8")) + [eos_id]
-        tokens = pt.tensor(token_list, dtype=pt.long).unsqueeze(0).cuda()
-        input_tokens = tokens[:, :-1]
-        target_tokens = tokens[:, 1:]
-        logits = model(input_tokens)  # shape: [1, seq_len, vocab_size]
-        loss = F.cross_entropy(
-            logits.view(-1, config.model.vocab_size),
-            target_tokens.view(-1),
-            reduction="mean",
-        )
-        # Convert from nats to bits
-        bpb = loss.item() / math.log(2)
-    model.train()
-    return bpb
+    random.seed(seed)
+    np.random.seed(seed)
+    pt.manual_seed(seed)
+    if pt.cuda.is_available():
+        pt.cuda.manual_seed_all(seed)
+    pt.backends.cudnn.deterministic = True
+    pt.backends.cudnn.benchmark = False
 
 
-# -------------------------------
 # Main training loop
-# -------------------------------
 def main():
     parser = argparse.ArgumentParser(
         description="Train BLT Entropy Model on a binary token file"
@@ -141,6 +134,7 @@ def main():
         if args.overrides
         else base_config
     )
+    print(config)
 
     checkpoint_dir = os.path.join(config.dump_dir, config.name)
 
@@ -148,18 +142,21 @@ def main():
     wandb.run.name = config.name
     print(f"Run name: {config.name}")
 
-    pt.manual_seed(config.seed)
-    if pt.cuda.is_available():
-        pt.cuda.manual_seed_all(config.seed)
+    seed_everything(config.seed)
 
     dataset = BinaryDataset(file_path=config.data.file, seq_len=config.data.seq_len)
     dataloader = DataLoader(
         dataset,
         batch_size=config.data.batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=config.data.workers,
     )
-    model = EntropyModel(config.model).cuda()
+
+    # Use a manual iterator to log loading times
+    dataloader_iter = iter(dataloader)
+
+    model = EntropyModel(config).cuda()
+    print(model)
 
     if getattr(config.optim, "enable_dynamo", False):
         print("Torch Dynamo enabled: compiling model...")
@@ -178,9 +175,7 @@ def main():
         lr_min_ratio=config.optim.lr_min_ratio,
     )
 
-    # -------------------------------
     # Resume from checkpoint if provided
-    # -------------------------------
     if config.checkpoint.resume_from:
         if os.path.isfile(config.checkpoint.resume_from):
             checkpoint = pt.load(config.checkpoint.resume_from)
@@ -189,6 +184,17 @@ def main():
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             step = checkpoint["step"]
             print(f"Resumed training from checkpoint at step {step}.")
+
+            skip_count = 0
+            while skip_count < step:
+                try:
+                    _ = next(dataloader_iter)
+                    skip_count += 1
+                except StopIteration:
+                    dataloader_iter = iter(dataloader)
+            print(
+                f"Skipped {skip_count} batches to resume data loader at batch #{skip_count}."
+            )
         else:
             print(
                 f"Checkpoint file {config.checkpoint.resume_from} not found. Starting fresh."
@@ -202,13 +208,13 @@ def main():
     val_interval = config.training.val_interval
     os.makedirs(checkpoint_dir, exist_ok=True)
     start_time = time.time()
+    last_log_time = start_time
 
-    # Variables to accumulate metrics over the logging interval.
-    interval_data_load_time = 0.0
+    # Variables to accumulate metrics
     interval_bytes = 0
-    global_bytes = 0  # cumulative bytes processed
+    global_bytes = 0
 
-    # Precompute constant FLOPs per token (using non-embedding parameters)
+    # Precompute FLOPs per token
     total_params = count_parameters(model)
     embed_params = config.model.vocab_size * config.model.dim
     non_embed_params = total_params - embed_params
@@ -219,135 +225,132 @@ def main():
         config.data.seq_len,
     )
 
-    val_prompts = [""]  # empty prompt for free generation.
-    temperatures = [0.5, 1.0, 1.5]
+    # Two validation prompts: one empty and one with sample text.
+    val_prompts = ["", "The meaning of life is"]
+    temperatures = [0.5, 0.75, 1.0]
     max_new_tokens = 256
 
     while step < config.training.total_steps:
-        for input_seq, target_seq in dataloader:
-            # Measure data loading time.
-            data_load_start = time.time()
-            input_seq = input_seq.cuda()
-            target_seq = target_seq.cuda()
-            data_load_time = time.time() - data_load_start
-            interval_data_load_time += data_load_time
+        # Capture full fetch time (from DataLoader)
+        t_fetch_start = time.time()
+        try:
+            input_seq, target_seq = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(dataloader)
+            input_seq, target_seq = next(dataloader_iter)
 
-            # Count bytes processed (each token is stored as an integer)
-            batch_bytes = input_seq.numel()
-            interval_bytes += batch_bytes
-            global_bytes += batch_bytes
+        input_seq = input_seq.cuda()
+        target_seq = target_seq.cuda()
 
-            optimizer.zero_grad()
-            logits = model(input_seq)
-            loss = F.cross_entropy(
-                logits.view(-1, config.model.vocab_size), target_seq.view(-1)
+        data_load_time = time.time() - t_fetch_start
+
+        batch_bytes = input_seq.numel()
+        interval_bytes += batch_bytes
+        global_bytes += batch_bytes
+
+        t_step_start = time.time()
+        optimizer.zero_grad()
+        logits = model(input_seq)
+        loss = F.cross_entropy(
+            logits.view(-1, config.model.vocab_size), target_seq.view(-1)
+        )
+        loss.backward()
+        pt.nn.utils.clip_grad_norm_(model.parameters(), config.optim.clip)
+        optimizer.step()
+        scheduler.step()
+        step += 1
+        step_time = time.time() - t_step_start
+
+        # Log metrics for this step
+        if step % log_freq == 0:
+            current_time = time.time()
+            full_interval_time = current_time - last_log_time
+            last_log_time = current_time
+
+            current_lr = scheduler.get_last_lr()[0]
+            grad_norm = (
+                sum(
+                    p.grad.data.norm(2).item()
+                    for p in model.parameters()
+                    if p.grad is not None
+                )
+            ) ** 0.5
+            tokens_this_step = config.data.batch_size * config.data.seq_len
+            tokens_processed = step * tokens_this_step
+            wps = tokens_this_step / full_interval_time
+            estimated_flops = tokens_processed * constant_flops_per_token
+            bpb = loss.item() / math.log(2)
+
+            # Compute overall elapsed time and ETA
+            elapsed_time = time.time() - start_time
+            remaining_steps = config.training.total_steps - step
+            avg_step_time = elapsed_time / step
+            eta = remaining_steps * avg_step_time
+
+            metrics = {
+                "loss": loss.item(),
+                "bpb": bpb,
+                "wps": wps,
+                "data_load_time": data_load_time,
+                "step_time": step_time,
+                "iter_time": full_interval_time,
+                "grad_norm": grad_norm,
+                "estimated_flops": estimated_flops,
+                "bytes": global_bytes,
+                "lr": current_lr,
+            }
+            print(
+                f"Step {step}: loss={loss.item():.4f}, lr={current_lr:.2e}, grad_norm={grad_norm:.2e}, "
+                f"iter_time={full_interval_time:.4f}s, wps={wps:.2e}, estimated_flops={estimated_flops:.2e}, "
+                f"bytes={global_bytes:.2e}, bpb={bpb:.4f}, data_load_time={data_load_time:.4f}s, "
+                f"ETA: {eta:.1f}s"
             )
-            loss.backward()
-            pt.nn.utils.clip_grad_norm_(model.parameters(), config.optim.clip)
-            optimizer.step()
-            scheduler.step()
-            step += 1
+            log_metrics(metrics, step)
 
-            if step % log_freq == 0:
-                elapsed = time.time() - start_time
-                current_lr = scheduler.get_last_lr()[0]
-                grad_norm = (
-                    sum(
-                        p.grad.data.norm(2).item() ** 2
-                        for p in model.parameters()
-                        if p.grad is not None
-                    )
-                ) ** 0.5
-                tokens_processed = step * config.data.batch_size * config.data.seq_len
-                wps = tokens_processed / elapsed
+        if step % config.checkpoint.dump.every == 0:
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                step,
+                checkpoint_dir,
+                config.checkpoint.dump.keep,
+            )
 
-                # Compute cumulative estimated FLOPs so far.
-                global_estimated_flops = tokens_processed * constant_flops_per_token
-
-                bpb = loss.item() / math.log(2)
-                metrics = {
-                    "loss": loss.item(),
-                    "lr": current_lr,
-                    "grad_norm": grad_norm,
-                    "iter_time": elapsed / step,
-                    "wps": wps,
-                    "global_estimated_flops": global_estimated_flops,
-                    "global_bytes": global_bytes,
-                    "data_load_time": interval_data_load_time / log_freq,
-                    "bpb": bpb,
-                }
-                print(
-                    f"Step {step}: loss={loss.item():.4f}, lr={current_lr:.2e}, grad_norm={grad_norm:.2e}, "
-                    f"iter_time={metrics['iter_time']:.4f} s, wps={wps:.2e}, "
-                    f"global_estimated_flops={global_estimated_flops:.2e}, global_bytes={global_bytes:.2e}, "
-                    f"bpb={bpb:.4f}, data_load_time={metrics['data_load_time']:.4f} s"
-                )
-                log_metrics(metrics, step)
-                # Reset the interval accumulators.
-                interval_data_load_time = 0.0
-                interval_bytes = 0
-
-            if step % config.checkpoint.dump.every == 0:
-                save_checkpoint(
-                    model,
-                    optimizer,
-                    scheduler,
-                    step,
-                    checkpoint_dir,
-                    config.checkpoint.dump.keep,
-                )
-
-            if step % val_interval == 0:
-                # ---------------------------
-                # 1) Log text generation samples
-                # ---------------------------
-                sample_text_table = wandb.Table(
-                    columns=["id", "temperature", "token_ids", "response"]
-                )
+        if step % val_interval == 0:
+            # Create a new table for this validation interval
+            val_table = wandb.Table(
+                columns=["step", "id", "temperature", "prompt", "token_ids", "response"]
+            )
+            for prompt in val_prompts:
                 for i, temp in enumerate(temperatures):
-                    for j, prompt in enumerate(val_prompts):
-                        prompt_tokens = (
-                            pt.tensor(text_to_tokens(prompt), dtype=pt.long)
-                            .unsqueeze(0)
-                            .cuda()
-                        )
-                        gen_tokens = generate_text_sample(
-                            model, prompt_tokens, max_new_tokens, temperature=temp
-                        )
-                        response = decode_tokens(gen_tokens[0])
-                        uid = f"{i}_{j}_{step}"
-                        sample_text_table.add_data(
-                            uid, temp, gen_tokens[0].tolist(), response
-                        )
-                wandb.log({"samples": sample_text_table}, step=step)
+                    prompt_tokens = (
+                        pt.tensor(text_to_tokens(prompt), dtype=pt.long)
+                        .unsqueeze(0)
+                        .cuda()
+                    )
+                    gen_tokens = generate_text_sample(
+                        model, prompt_tokens, max_new_tokens, temperature=temp
+                    )
+                    response = decode_tokens(gen_tokens[0])
+                    uid = f"{hash(prompt)}_{i}_{step}"
+                    val_table.add_data(
+                        step, uid, temp, prompt, gen_tokens[0].tolist(), response
+                    )
+            wandb.log({"samples": val_table}, step=step)
 
-                # ---------------------------
-                # 2) Compute & log entropy for a fixed sentence
-                # ---------------------------
-                test_sentence = "Daenerys Targeryen is in Game of Thrones, a fantasy epic by George R.R. Martin."
-                entropy_bpb = compute_text_entropy(model, test_sentence, config)
-                wandb.log({"val/entropy_daenerys_sentence_bpb": entropy_bpb}, step=step)
+        if step >= config.training.total_steps:
+            break
 
-            if step >= config.training.total_steps:
-                break
-
-    # Log final cumulative metrics.
     final_elapsed = time.time() - start_time
     final_tokens = step * config.data.batch_size * config.data.seq_len
     final_estimated_flops = final_tokens * constant_flops_per_token
+
     print(f"Training complete in {final_elapsed:.2f} seconds.")
     print(f"Total tokens processed: {final_tokens}")
     print(f"Total estimated FLOPs: {final_estimated_flops:.2e}")
     print(f"Total bytes processed: {global_bytes}")
 
-    wandb.log(
-        {
-            "final_elapsed": final_elapsed,
-            "final_tokens": final_tokens,
-            "final_estimated_flops": final_estimated_flops,
-            "global_bytes": global_bytes,
-        }
-    )
     wandb.finish()
 
 
