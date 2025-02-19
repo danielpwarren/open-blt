@@ -23,34 +23,51 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, keep):
+def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, keep=3):
+    """
+    Saves a new checkpoint as 'checkpoint_latest.pt'. If a previous checkpoint_latest exists,
+    it is renamed to include its step number (e.g. checkpoint_00500.pt). Then, only the last
+    'keep' renamed checkpoints are retained.
+    """
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{step:06d}.pt")
-    pt.save(
-        {
-            "step": step,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-        },
-        checkpoint_path,
+    latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+
+    # If a latest checkpoint exists, rename it to its step-numbered filename.
+    if os.path.exists(latest_path):
+        try:
+            prev_ckpt = pt.load(latest_path, map_location="cpu")
+            prev_step = prev_ckpt.get("step", 0)
+        except Exception as e:
+            print("Warning: could not load previous checkpoint to get step; using 0", e)
+            prev_step = 0
+        renamed_path = os.path.join(checkpoint_dir, f"checkpoint_{prev_step:06d}.pt")
+        os.rename(latest_path, renamed_path)
+        print(f"Renamed previous checkpoint to {renamed_path}")
+
+    # Save the new checkpoint as 'checkpoint_latest.pt'
+    checkpoint_data = {
+        "step": step,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+    }
+    pt.save(checkpoint_data, latest_path)
+    wandb.save(latest_path)
+    print(f"Checkpoint saved at {latest_path}")
+
+    # Remove older checkpoints if more than 'keep' exist.
+    # We consider only files named "checkpoint_{step}.pt" (excluding checkpoint_latest.pt).
+    all_ckpts = sorted(
+        [
+            f for f in os.listdir(checkpoint_dir)
+            if f.startswith("checkpoint_") and f.endswith(".pt") and f != "checkpoint_latest.pt"
+        ],
+        key=lambda x: int(x.split("_")[1].split(".")[0])
     )
-    wandb.save(checkpoint_path)
-    print(f"Checkpoint saved at {checkpoint_path}")
-    # Remove older checkpoints if the number saved exceeds 'keep'
-    if keep > 0:
-        all_ckpts = sorted(
-            [
-                f
-                for f in os.listdir(checkpoint_dir)
-                if f.startswith("checkpoint_") and f.endswith(".pt")
-            ],
-            key=lambda x: int(x.split("_")[1].split(".")[0]),
-        )
-        if len(all_ckpts) > keep:
-            for ckpt in all_ckpts[:-keep]:
-                os.remove(os.path.join(checkpoint_dir, ckpt))
-                print(f"Removed old checkpoint {ckpt}")
+    if len(all_ckpts) > keep:
+        for ckpt in all_ckpts[:-keep]:
+            os.remove(os.path.join(checkpoint_dir, ckpt))
+            print(f"Removed old checkpoint {ckpt}")
 
 
 def text_to_tokens(text, bos_id=257, eos_id=258):
@@ -226,8 +243,8 @@ def main():
     )
 
     # Two validation prompts: one empty and one with sample text.
-    val_prompts = ["", "The meaning of life is"]
-    temperatures = [0.5, 0.75, 1.0]
+    val_prompts = ["", "The meaning of life is", "Game of Thrones is", "The best way to cook pasta is"]
+    temperatures = [0.5, 0.75, 1.0, 1.25, 1.5]
     max_new_tokens = 256
 
     while step < config.training.total_steps:
@@ -288,16 +305,17 @@ def main():
             eta = remaining_steps * avg_step_time
 
             metrics = {
+                "lr": current_lr,
                 "loss": loss.item(),
                 "bpb": bpb,
                 "wps": wps,
                 "data_load_time": data_load_time,
                 "step_time": step_time,
                 "iter_time": full_interval_time,
+                "eta": eta,
                 "grad_norm": grad_norm,
                 "estimated_flops": estimated_flops,
                 "bytes": global_bytes,
-                "lr": current_lr,
             }
             print(
                 f"Step {step}: loss={loss.item():.4f}, lr={current_lr:.2e}, grad_norm={grad_norm:.2e}, "

@@ -4,7 +4,7 @@ dump_dir: "./checkpoints"
 
 training:
   total_steps: 100000
-  val_interval: 500  # How often to run a validation-generation step
+  val_interval: 1000  # How often to run a validation-generation step
 
 model:
   # Transformer configuration parameters
@@ -50,6 +50,6 @@ logging:
 
 checkpoint:
   dump:
-    every: 500
+    every: 1000
     keep: 3
   resume_from: ""  # Provide path to checkpoint file to resume training, or leave blank to start fresh
