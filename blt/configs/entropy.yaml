@@ -1,9 +1,9 @@
 seed: 42
-name: "blt-entropy-pile"
+name: "blt-entropy-4096ctx"
 dump_dir: "./checkpoints"
 
 training:
-  total_steps: 100000
+  epochs: 1  # Number of epochs to train for
   val_interval: 1000  # How often to run a validation-generation step
 
 model:
@@ -21,17 +21,19 @@ model:
   rope_use_fp32_in_outer_product: false
   init_base_std: null    # Optional; if null, uses default initialization std
   init_std_factor: "disabled"  # Options: "disabled", "global_depth", "current_depth", "dim_ratio"
-  max_seqlen: 8192       # Maximum sequence length (will be overridden by data.seq_len if needed)
+  max_seqlen: 4096       # Maximum sequence length
   attn_impl: "xformers"   # Options include "xformers", "sdpa", etc.
   attn_bias_type: "local_block_causal"
   sliding_window: 512     # Set to null if not using sliding-window attention
   weight_tying: false
 
 data:
-  file: "pile.bin"
-  seq_len: 8192
-  batch_size: 2
+  train_dir: "~/Documents/EleutherAI_ThePile_v1/pile/train"  # Directory containing training files
+  val_file: "~/Documents/EleutherAI_ThePile_v1/pile/val.jsonl.zst"  # Validation file path
+  seq_len: 4096
+  batch_size: 6
   workers: 16
+  max_val_samples: 4  # Maximum number of validation samples to load
 
 optim:
   lr: 4e-4
