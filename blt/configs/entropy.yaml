@@ -1,5 +1,5 @@
 seed: 42
-name: "blt-entropy-4096ctx"
+name: "blt-entropy-fine_web_edu-4096ctx"
 dump_dir: "./checkpoints"
 
 training:
@@ -28,8 +28,8 @@ model:
   weight_tying: false
 
 data:
-  train_dir: "~/Documents/EleutherAI_ThePile_v1/pile/train"  # Directory containing training files
-  val_file: "~/Documents/EleutherAI_ThePile_v1/pile/val.jsonl.zst"  # Validation file path
+  train_dir: "~/Documents/fine_web_edu_latest_shuff/train"  # Directory containing training files
+  val_file: "~/Documents/fine_web_edu_latest_shuff/val.jsonl"  # Validation file path
   seq_len: 4096
   batch_size: 6
   workers: 16

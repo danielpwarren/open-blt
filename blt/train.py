@@ -3,6 +3,7 @@ import math
 import os
 import random
 import time
+import json
 
 import numpy as np
 import torch as pt
@@ -11,7 +12,7 @@ import wandb
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from blt.data.pile_dataset import PileDataset, PileValidationDataset
+from blt.data.jsonl_dataset import JsonlDataset, JsonlValidationDataset
 from blt.model.entropy import EntropyModel
 from blt.model.utils import get_num_flop_per_token
 from blt.utils.logging import init_wandb, log_metrics
@@ -97,7 +98,7 @@ def seed_everything(seed):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train BLT Entropy Model on The Pile dataset"
+        description="Train BLT Entropy Model on JSONL dataset"
     )
     parser.add_argument(
         "--config",
@@ -128,24 +129,49 @@ def main():
 
     tokenizer = ByteTokenizer()
 
-    # Expand user directory for paths
-    train_dir = os.path.expanduser(config.data.train_dir)
-    val_file = os.path.expanduser(config.data.val_file)
-
     # Create training dataset
-    train_dataset = PileDataset(
-        data_dir=train_dir,
+    train_dataset = JsonlDataset(
+        data_dir=config.data.train_dir,
         seq_len=config.data.seq_len,
         shuffle_files=True,
-        seed=config.seed
+        seed=config.seed,
     )
     
     # Create validation dataset
-    val_dataset = PileValidationDataset(
-        val_file=val_file,
+    val_dataset = JsonlValidationDataset(
+        val_file=config.data.val_file,
         seq_len=config.data.seq_len,
-        max_samples=config.data.max_val_samples
+        max_samples=config.data.max_val_samples,
     )
+
+    # Calculate total steps if cache doesn't exist or config has changed
+    steps_cache_file = os.path.join(config.dump_dir, "steps_cache.json")
+    cache_config = {
+        "train_dir": config.data.train_dir,
+        "seq_len": config.data.seq_len,
+        "batch_size": config.data.batch_size,
+    }
+    
+    if os.path.exists(steps_cache_file):
+        with open(steps_cache_file, 'r') as f:
+            cache = json.load(f)
+            if cache["config"] == cache_config:
+                total_steps = cache["total_steps"]
+                print(f"Using cached total steps: {total_steps}")
+            else:
+                print("Config changed, recalculating total steps...")
+                total_steps = train_dataset.calculate_total_steps(config.data.batch_size)
+                os.makedirs(config.dump_dir, exist_ok=True)
+                with open(steps_cache_file, 'w') as f:
+                    json.dump({"config": cache_config, "total_steps": total_steps}, f)
+    else:
+        print("Calculating total steps for the first time...")
+        total_steps = train_dataset.calculate_total_steps(config.data.batch_size)
+        os.makedirs(config.dump_dir, exist_ok=True)
+        with open(steps_cache_file, 'w') as f:
+            json.dump({"config": cache_config, "total_steps": total_steps}, f)
+    
+    print(f"Total training steps: {total_steps}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -154,7 +180,7 @@ def main():
     )
     
     # Create validation iterator
-    val_batch_size = 4  # Small fixed batch size for quick validation
+    val_batch_size = 8  # Small fixed batch size for quick validation
     val_loader = DataLoader(
         val_dataset,
         batch_size=val_batch_size,
@@ -164,8 +190,6 @@ def main():
     val_iter = iter(val_loader)
 
     # Since we're streaming data, we need to estimate total steps
-    # We'll use a large number and let training run until stopped
-    total_steps = 1000000  # Can be stopped early
     warmup_steps = config.optim.warmup
     print(f"Training will run for up to {total_steps} steps")
     print(f"Warmup steps: {warmup_steps}")
@@ -253,6 +277,10 @@ def main():
         config.data.seq_len,
     )
 
+    # Initialize loss tracking
+    total_loss_sum = 0.0
+    total_loss_count = 0
+
     while step < total_steps:
         t_fetch_start = time.time()
         try:
@@ -283,6 +311,12 @@ def main():
         step += 1
         step_time = time.time() - t_step_start
 
+        # Update loss tracking
+        loss_val = loss.item()
+        total_loss_sum += loss_val
+        total_loss_count += 1
+        avg_loss = total_loss_sum / total_loss_count
+
         if step % log_freq == 0:
             current_time = time.time()
             full_interval_time = current_time - last_log_time
@@ -300,7 +334,8 @@ def main():
             tokens_processed = step * tokens_this_step
             wps = tokens_this_step / full_interval_time
             estimated_flops = tokens_processed * constant_flops_per_token
-            bpb = loss.item() / math.log(2)
+            bpb = loss_val / math.log(2)
+            avg_bpb = avg_loss / math.log(2)
 
             elapsed_time = time.time() - start_time
             remaining_steps = total_steps - step
@@ -309,8 +344,10 @@ def main():
 
             metrics = {
                 "lr": current_lr,
-                "loss": loss.item(),
+                "loss": loss_val,
+                "avg_loss": avg_loss,
                 "bpb": bpb,
+                "avg_bpb": avg_bpb,
                 "wps": wps,
                 "data_load_time": data_load_time,
                 "step_time": step_time,
@@ -321,7 +358,8 @@ def main():
                 "bytes": global_bytes,
             }
             print(
-                f"Step {step}: loss={loss.item():.4f}, lr={current_lr:.2e}, grad_norm={grad_norm:.2e}, "
+                f"Step {step}: loss={loss_val:.4f} (avg={avg_loss:.4f}), "
+                f"lr={current_lr:.2e}, grad_norm={grad_norm:.2e}, "
                 f"iter_time={full_interval_time:.4f}s, wps={wps:.2e}, estimated_flops={estimated_flops:.2e}, "
                 f"bytes={global_bytes:.2e}, bpb={bpb:.4f}, data_load_time={data_load_time:.4f}s, "
                 f"ETA: {eta:.1f}s"
