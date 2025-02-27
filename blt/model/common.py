@@ -1,5 +1,3 @@
-import os
-
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 from xformers.ops import fmha
@@ -74,16 +72,11 @@ def create_causal_mask(
                 window_left=sliding_window - 1, window_right=0
             )
     elif attn_impl == "sdpa":
-        BLT_SUPPRESS_ATTN_ERROR = int(os.environ.get("BLT_SUPPRESS_ATTN_ERROR", 0))
-
         if attn_bias_type == "causal":
-            return "causal"
-
-        if BLT_SUPPRESS_ATTN_ERROR == 1:
             return "causal"
         else:
             raise ValueError(
-                "SDPA attention being used, which doesn't have specialized attention implementations for block_causal and local_block_causal attention. To suppress this error and run the model anyway, set the environment variable BLT_SUPPRESS_ATTN_ERROR=1"
+                "SDPA attention being used, which doesn't have specialized attention implementations for block_causal and local_block_causal attention."
             )
     elif attn_impl == "flex_attention":
         return create_block_mask(causal_mask, None, None, seqlen, seqlen)

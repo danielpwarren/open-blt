@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+import logging
 from typing import Optional, Tuple, Union
 
 import torch
@@ -19,28 +19,17 @@ from blt.model.base_transformer import (
     BaseTransformerArgs,
     cross_entropy,
 )
-from blt.model.utils import create_causal_mask
+from blt.model.common import create_causal_mask
+
+logger = logging.getLogger(__name__)
 
 try:
     from apex.normalization.fused_layer_norm import FusedRMSNorm
 
     RMSNorm = FusedRMSNorm
 except (ImportError, ModuleNotFoundError):
-    print("Apex not found. Using nn.RMSNorm")
+    logger.info("Apex not found. Using nn.RMSNorm")
     RMSNorm = nn.RMSNorm
-
-
-def attention_flops_per_token(n_layers, seq_len, dim, causal):
-    # Formula from https://github.com/Dao-AILab/flash-attention/blob/main/benchmarks/benchmark_flash_attention.py#L27-L30
-    return 3.5 * (4 * n_layers * seq_len * dim // (2 if causal else 1))
-
-
-def get_num_flop_per_token(
-    num_non_embed_params: int, n_layers: int, dim: int, seq_len: int
-) -> int:
-    return 6 * num_non_embed_params + attention_flops_per_token(
-        n_layers, seq_len, dim, True
-    )
 
 
 def causal_mask(b, h, q_idx, kv_idx):

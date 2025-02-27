@@ -178,3 +178,5 @@ checkpoints
 *.txt
 !requirements.txt
 *.bin
+data
+*.jsonl

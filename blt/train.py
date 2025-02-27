@@ -1,9 +1,11 @@
 import argparse
+import datetime
+import json
+import logging
 import math
 import os
 import random
 import time
-import json
 
 import numpy as np
 import torch as pt
@@ -13,56 +15,19 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from blt.data.jsonl_dataset import JsonlDataset, JsonlValidationDataset
+from blt.model.common import get_num_flop_per_token
 from blt.model.entropy import EntropyModel
-from blt.model.utils import get_num_flop_per_token
-from blt.utils.logging import init_wandb, log_metrics
-from blt.utils.optim import build_optimizer, get_cosine_schedule
 from blt.tokenizer.byte_tokenizer import ByteTokenizer
+from blt.utils.checkpoint import save_checkpoint
+from blt.utils.logging import init_wandb, log_metrics, log_model_summary, setup_logging
+from blt.utils.optim import build_optimizer, get_cosine_schedule
+
+logger = logging.getLogger(__name__)
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, keep=3):
-    """
-    Saves a new checkpoint as 'checkpoint_latest.pt'. If a previous checkpoint_latest exists,
-    it is renamed to include its step number (e.g. checkpoint_00500.pt). Then, only the last
-    'keep' renamed checkpoints are retained.
-    """
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
-
-    if os.path.exists(latest_path):
-        try:
-            prev_ckpt = pt.load(latest_path, map_location="cpu")
-            prev_step = prev_ckpt.get("step", 0)
-        except Exception as e:
-            print("Warning: could not load previous checkpoint to get step; using 0", e)
-            prev_step = 0
-        renamed_path = os.path.join(checkpoint_dir, f"checkpoint_{prev_step:06d}.pt")
-        os.rename(latest_path, renamed_path)
-        print(f"Renamed previous checkpoint to {renamed_path}")
-
-    checkpoint_data = {
-        "step": step,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-    }
-    pt.save(checkpoint_data, latest_path)
-    wandb.save(latest_path)
-    print(f"Checkpoint saved at {latest_path}")
-
-    all_ckpts = sorted(
-        [
-            f for f in os.listdir(checkpoint_dir)
-            if f.startswith("checkpoint_") and f.endswith(".pt") and f != "checkpoint_latest.pt"
-        ],
-        key=lambda x: int(x.split("_")[1].split(".")[0])
-    )
-    if len(all_ckpts) > keep:
-        for ckpt in all_ckpts[:-keep]:
-            os.remove(os.path.join(checkpoint_dir, ckpt))
-            print(f"Removed old checkpoint {ckpt}")
 
 def generate_text_sample(model, prompt, max_new_tokens, temperature):
     """
@@ -87,6 +52,7 @@ def generate_text_sample(model, prompt, max_new_tokens, temperature):
     model.train()
     return generated
 
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -95,6 +61,7 @@ def seed_everything(seed):
         pt.cuda.manual_seed_all(seed)
     pt.backends.cudnn.deterministic = True
     pt.backends.cudnn.benchmark = False
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -117,13 +84,18 @@ def main():
         if args.overrides
         else base_config
     )
-    print(config)
+
+    log_dir = os.path.join("logs", os.path.basename(args.config).split(".")[0])
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"{time.strftime('%Y%m%d_%H%M%S')}.log")
+    setup_logging(log_file=log_file)
+
+    logger.info(f"Full Config: {config}")
 
     checkpoint_dir = os.path.join(config.dump_dir, config.name)
 
     init_wandb(config)
-    wandb.run.name = config.name
-    print(f"Run name: {config.name}")
+    logger.info(f"Run name: {config.name}")
 
     seed_everything(config.seed)
 
@@ -136,7 +108,7 @@ def main():
         shuffle_files=True,
         seed=config.seed,
     )
-    
+
     # Create validation dataset
     val_dataset = JsonlValidationDataset(
         val_file=config.data.val_file,
@@ -151,61 +123,60 @@ def main():
         "seq_len": config.data.seq_len,
         "batch_size": config.data.batch_size,
     }
-    
+
     if os.path.exists(steps_cache_file):
-        with open(steps_cache_file, 'r') as f:
+        with open(steps_cache_file, "r") as f:
             cache = json.load(f)
             if cache["config"] == cache_config:
                 total_steps = cache["total_steps"]
-                print(f"Using cached total steps: {total_steps}")
+                logger.info(f"Using cached total steps: {total_steps}")
             else:
-                print("Config changed, recalculating total steps...")
-                total_steps = train_dataset.calculate_total_steps(config.data.batch_size)
+                logger.info("Config changed, recalculating total steps...")
+                total_steps = train_dataset.calculate_total_steps(
+                    config.data.batch_size
+                )
                 os.makedirs(config.dump_dir, exist_ok=True)
-                with open(steps_cache_file, 'w') as f:
+                with open(steps_cache_file, "w") as f:
                     json.dump({"config": cache_config, "total_steps": total_steps}, f)
     else:
-        print("Calculating total steps for the first time...")
+        logger.info("Calculating total steps for the first time...")
         total_steps = train_dataset.calculate_total_steps(config.data.batch_size)
         os.makedirs(config.dump_dir, exist_ok=True)
-        with open(steps_cache_file, 'w') as f:
+        with open(steps_cache_file, "w") as f:
             json.dump({"config": cache_config, "total_steps": total_steps}, f)
-    
-    print(f"Total training steps: {total_steps}")
+
+    logger.info(f"Total training steps: {total_steps}")
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.data.batch_size,
         num_workers=config.data.workers,
     )
-    
+
     # Create validation iterator
     val_batch_size = 8  # Small fixed batch size for quick validation
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=val_batch_size,
-        shuffle=True,
-        num_workers=1
+        val_dataset, batch_size=val_batch_size, shuffle=True, num_workers=1
     )
     val_iter = iter(val_loader)
 
     # Since we're streaming data, we need to estimate total steps
     warmup_steps = config.optim.warmup
-    print(f"Training will run for up to {total_steps} steps")
-    print(f"Warmup steps: {warmup_steps}")
+    logger.info(f"Training will run for up to {total_steps} steps")
+    logger.info(f"Warmup steps: {warmup_steps}")
 
     train_iter = iter(train_loader)
 
     model = EntropyModel(config).cuda()
-    print(model)
+    logger.info(f"Model: {model}")
 
     if getattr(config.optim, "enable_dynamo", False):
-        print("Torch Dynamo enabled: compiling model...")
+        logger.info("Torch Dynamo enabled: compiling model...")
         model = pt.compile(model)
 
-    wandb.watch(model, log="all")
+    log_model_summary(model)
     param_count = count_parameters(model)
-    print(f"Model parameter count: {param_count}")
+    logger.info(f"Model parameter count: {param_count}")
     wandb.run.summary["param_count"] = param_count
 
     optimizer = build_optimizer(model, config.optim)
@@ -217,21 +188,21 @@ def main():
     )
 
     # Log initial generation before any training
-    print("Generating initial sample before training...")
+    logger.info("Generating initial sample before training...")
     model.eval()
     prompt_tokens = pt.tensor([[tokenizer.bos_id]], dtype=pt.long).cuda()
     gen_tokens = generate_text_sample(
         model, prompt_tokens, max_new_tokens=256, temperature=1.0
     )
     response = tokenizer.decode(gen_tokens[0].tolist())
-    
+
     val_table = wandb.Table(columns=["step", "response"])
     val_table.add_data(0, response)
     metrics = {
         "samples": val_table,
     }
     wandb.log(metrics, step=0)
-    print("Initial generation complete. Starting training...")
+    logger.info("Initial generation complete. Starting training...")
     model.train()
 
     if config.checkpoint.resume_from:
@@ -241,7 +212,7 @@ def main():
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             step = checkpoint["step"]
-            print(f"Resumed training from checkpoint at step {step}.")
+            logger.info(f"Resumed training from checkpoint at step {step}.")
 
             skip_count = 0
             while skip_count < step:
@@ -250,9 +221,13 @@ def main():
                     skip_count += 1
                 except StopIteration:
                     train_iter = iter(train_loader)
-            print(f"Skipped {skip_count} batches to resume data loader at batch #{skip_count}.")
+            logger.info(
+                f"Skipped {skip_count} batches to resume data loader at batch #{skip_count}."
+            )
         else:
-            print(f"Checkpoint file {config.checkpoint.resume_from} not found. Starting fresh.")
+            logger.info(
+                f"Checkpoint file {config.checkpoint.resume_from} not found. Starting fresh."
+            )
             step = 0
     else:
         step = 0
@@ -341,6 +316,7 @@ def main():
             remaining_steps = total_steps - step
             avg_step_time = elapsed_time / step
             eta = remaining_steps * avg_step_time
+            eta_str = str(datetime.timedelta(seconds=int(eta)))
 
             metrics = {
                 "lr": current_lr,
@@ -357,12 +333,12 @@ def main():
                 "estimated_flops": estimated_flops,
                 "bytes": global_bytes,
             }
-            print(
+            logger.info(
                 f"Step {step}: loss={loss_val:.4f} (avg={avg_loss:.4f}), "
                 f"lr={current_lr:.2e}, grad_norm={grad_norm:.2e}, "
                 f"iter_time={full_interval_time:.4f}s, wps={wps:.2e}, estimated_flops={estimated_flops:.2e}, "
                 f"bytes={global_bytes:.2e}, bpb={bpb:.4f}, data_load_time={data_load_time:.4f}s, "
-                f"ETA: {eta:.1f}s"
+                f"ETA: {eta_str}"
             )
             log_metrics(metrics, step)
 
@@ -378,47 +354,49 @@ def main():
 
         if step % val_interval == 0:
             model.eval()
-            
+
             # Get next validation batch, recreate iterator if needed
             try:
                 val_input, val_target = next(val_iter)
             except StopIteration:
                 val_iter = iter(val_loader)
                 val_input, val_target = next(val_iter)
-            
+
             # Compute validation loss on single batch
             val_input = val_input.cuda()
             val_target = val_target.cuda()
             with pt.no_grad():
                 val_loss = F.cross_entropy(
                     model(val_input).view(-1, config.model.vocab_size),
-                    val_target.view(-1)
+                    val_target.view(-1),
                 )
             val_bpb = val_loss.item() / math.log(2)
-            
+
             # Generate sample starting with just BOS token
-            val_table = wandb.Table(
-                columns=["step", "response"]
-            )
-            
+            val_table = wandb.Table(columns=["step", "response"])
+
             # Generate from BOS token only
-            prompt_tokens = pt.tensor([[tokenizer.bos_id]], dtype=pt.long).cuda()  # BOS token
+            prompt_tokens = pt.tensor(
+                [[tokenizer.bos_id]], dtype=pt.long
+            ).cuda()  # BOS token
             gen_tokens = generate_text_sample(
                 model, prompt_tokens, max_new_tokens=256, temperature=1.0
             )
             response = tokenizer.decode(gen_tokens[0].tolist())
-            
+
             val_table.add_data(step, response)
-            
+
             # Log validation metrics
             metrics = {
                 "val_loss": val_loss.item(),
                 "val_bpb": val_bpb,
-                "samples": val_table
+                "samples": val_table,
             }
-            wandb.log(metrics, step=step)
-            print(f"Validation step {step}: loss={val_loss.item():.4f}, bpb={val_bpb:.4f}")
-            
+            log_metrics(metrics, step)
+            logger.info(
+                f"Validation step {step}: loss={val_loss.item():.4f}, bpb={val_bpb:.4f}"
+            )
+
             model.train()
 
         if step >= total_steps:
@@ -428,12 +406,14 @@ def main():
     final_tokens = step * config.data.batch_size * config.data.seq_len
     final_estimated_flops = final_tokens * constant_flops_per_token
 
-    print(f"Training complete in {final_elapsed:.2f} seconds.")
-    print(f"Total tokens processed: {final_tokens}")
-    print(f"Total estimated FLOPs: {final_estimated_flops:.2e}")
-    print(f"Total bytes processed: {global_bytes}")
+    logger.info(f"Training complete in {final_elapsed:.2f} seconds.")
+    logger.info(f"Total tokens processed: {final_tokens}")
+    logger.info(f"Total estimated FLOPs: {final_estimated_flops:.2e}")
+    logger.info(f"Total bytes processed: {global_bytes}")
 
-    wandb.finish()
+    if wandb.run is not None:
+        wandb.finish()
+
 
 if __name__ == "__main__":
     main()
