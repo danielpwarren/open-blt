@@ -20,7 +20,7 @@ model:
   rope_theta: 10000.0
   rope_use_fp32_in_outer_product: false
   init_base_std: null    # Optional; if null, uses default initialization std
-  init_std_factor: "disabled"  # Options: "disabled", "global_depth", "current_depth", "dim_ratio"
+  init_std_factor: "dim_ratio"  # Options: "disabled", "global_depth", "current_depth", "dim_ratio"
   max_seqlen: 4096       # Maximum sequence length
   attn_impl: "xformers"   # Options include "xformers", "sdpa", etc.
   attn_bias_type: "local_block_causal"
@@ -28,11 +28,11 @@ model:
   weight_tying: false
 
 data:
-  train_dir: "./data/fineweb/train"  # Directory containing training files
-  val_file: "./data/fineweb/val.jsonl"  # Validation file path
+  train_dir: "./data/train"  # Directory containing training files
+  val_file: "./data/val.jsonl"  # Validation file path
   seq_len: 4096
   batch_size: 6
-  workers: 16
+  workers: 8
   max_val_samples: 4  # Maximum number of validation samples to load
 
 optim:

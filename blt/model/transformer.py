@@ -1,3 +1,5 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
 import logging
 from typing import Optional, Tuple, Union
 
@@ -12,7 +14,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
-from xformers.ops import AttentionBias, fmha
+from xformers.ops import AttentionBias
 
 from blt.model.base_transformer import (
     BaseTransformer,
@@ -21,14 +23,14 @@ from blt.model.base_transformer import (
 )
 from blt.model.common import create_causal_mask
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 try:
     from apex.normalization.fused_layer_norm import FusedRMSNorm
 
     RMSNorm = FusedRMSNorm
 except (ImportError, ModuleNotFoundError):
-    logger.info("Apex not found. Using nn.RMSNorm")
+    logging.debug("Apex not found. Using nn.RMSNorm")
     RMSNorm = nn.RMSNorm
 
 
@@ -101,10 +103,11 @@ class LMTransformer(BaseTransformer):
             return logits
 
     def reset_parameters(self, init_std=None):
-        # Either use fixed base std or sqrt model dim
-        super().reset_parameters()
-        init_std = init_std or (self.dim ** (-0.5))
         self.norm.reset_parameters()
+
+    def init_weights(self):
+        self.reset_parameters()
+        init_std = self.dim ** (-0.5)
         nn.init.trunc_normal_(
             self.tok_embeddings.weight,
             mean=0.0,
@@ -112,6 +115,8 @@ class LMTransformer(BaseTransformer):
             a=-3 * init_std,
             b=3 * init_std,
         )
+        super().init_weights()
+
         if not self.weight_tying:
             nn.init.trunc_normal_(
                 self.output.weight,

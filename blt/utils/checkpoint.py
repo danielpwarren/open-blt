@@ -7,7 +7,7 @@ import wandb
 logger = logging.getLogger(__name__)
 
 
-def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, keep=3):
+def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, scaler=None, keep=3):
     """
     Saves a new checkpoint as 'checkpoint_latest.pt'. If a previous checkpoint_latest exists,
     it is renamed to include its step number (e.g. checkpoint_00500.pt). Then, only the last
@@ -35,6 +35,10 @@ def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, keep=3):
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
     }
+
+    if scaler is not None:
+        checkpoint_data["scaler_state_dict"] = scaler.state_dict()
+
     pt.save(checkpoint_data, latest_path)
     wandb.log_artifact(latest_path, "checkpoint_latest.pt", "checkpoint")
     logger.info(f"Checkpoint saved at {latest_path}")

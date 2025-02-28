@@ -1,3 +1,5 @@
+import abc
+import logging
 import os
 from enum import Enum
 from typing import Optional, Tuple, Union
@@ -13,7 +15,17 @@ from torch.nn.attention.flex_attention import (
 )
 from xformers.ops import AttentionBias, fmha
 
-EOS_ID = 258  # End of sentence token id (should be handled by config tbh)
+from blt.tokenizer.constants import EOS_ID
+
+logger = logging.getLogger()
+
+try:
+    from apex.normalization.fused_layer_norm import FusedRMSNorm
+
+    RMSNorm = FusedRMSNorm
+except (ImportError, ModuleNotFoundError):
+    logging.debug("Apex not found. Using nn.RMSNorm")
+    RMSNorm = nn.RMSNorm
 
 if int(os.environ.get("BLT_ALLOW_MISSING_FLEX_ATTENTION", False)) == 0:
     flex_attention_comp = torch.compile(flex_attention)
@@ -292,36 +304,6 @@ class RotaryEmbedding(torch.nn.Module):
             return self.freqs_cis[0:seqlen]
 
 
-class RMSNorm(nn.Module):
-    """
-    Initialize the RMSNorm normalization layer.
-
-    Args:
-        dim (int): The dimension of the input tensor.
-        eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
-
-    Attributes:
-        eps (float): A small value added to the denominator for numerical stability.
-        weight (nn.Parameter): Learnable scaling parameter.
-
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def _norm(self, x: torch.Tensor):
-        return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x: torch.Tensor):
-        output = self._norm(x.float())
-        return (output * self.weight.float()).type_as(x)
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)  # type: ignore
-
-
 def _reshape_for_attn_bias(
     attn_bias: AttentionBias | None,
     *tensors: torch.Tensor,
@@ -590,7 +572,13 @@ class TransformerBlock(nn.Module):
         self.ffn_norm.reset_parameters()
 
 
-class BaseTransformer(nn.Module):
+class SequenceModelWithOutput(abc.ABC):
+    @abc.abstractmethod
+    def get_output_seq_len(self) -> int:
+        pass
+
+
+class BaseTransformer(nn.Module, SequenceModelWithOutput):
     def __init__(self, args: BaseTransformerArgs):
         super().__init__()
         self.dim = args.dim
@@ -611,6 +599,9 @@ class BaseTransformer(nn.Module):
         for _ in range(args.n_layers):
             self.layers.append(TransformerBlock(args))
 
+    def get_output_seq_len(self):
+        return self.max_seqlen
+
     def forward(
         self,
         h,
@@ -625,12 +616,8 @@ class BaseTransformer(nn.Module):
             h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
         return h
 
-    def reset_parameters(self):
-        # Either use fixed base std or sqrt model dim
-        self.rope_embeddings.reset_parameters()
-
     def init_weights(self):
-        self.reset_parameters()
+        self.rope_embeddings.reset_parameters()
         for depth, layer in enumerate(self.layers):
             factor = {
                 InitStdFactor.CURRENT_DEPTH: (2 * (depth + 1)) ** 0.5,
