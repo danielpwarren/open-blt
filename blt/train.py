@@ -319,6 +319,7 @@ def train_model(
     checkpoint_dir,
     total_steps,
     device,
+    val_table,
 ):
     """Main training loop with modular components."""
     # Initialize training state
@@ -417,7 +418,7 @@ def train_model(
 
         # Run validation periodically
         if state.step % val_interval == 0:
-            validate_model(state, val_loader, device, config, tokenizer)
+            validate_model(state, val_loader, device, config, tokenizer, val_table)
 
     # Log final statistics
     final_elapsed = time.time() - state.start_time
@@ -590,6 +591,7 @@ def main():
         checkpoint_dir,
         total_steps,
         device,
+        val_table,
     )
 
     # Clean up
