@@ -27,10 +27,7 @@ except (ImportError, ModuleNotFoundError):
     logging.debug("Apex not found. Using nn.RMSNorm")
     RMSNorm = nn.RMSNorm
 
-if int(os.environ.get("BLT_ALLOW_MISSING_FLEX_ATTENTION", False)) == 0:
-    flex_attention_comp = torch.compile(flex_attention)
-else:
-    flex_attention_comp = None
+flex_attention_comp = torch.compile(flex_attention)
 
 
 class InitStdFactor(Enum):
@@ -167,10 +164,6 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def causal_mask(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
-
-
 def lengths_to_start_ids(lengths):
     doc_start = lengths.cumsum(0)
     doc_start = doc_start.roll(1)
@@ -194,58 +187,6 @@ def lengths_to_local_ids(lengths):
     return doc_id, tok_id
 
 
-def generate_doc_mask_mod(
-    mask_mod: _mask_mod_signature,
-    lengths: torch.Tensor,
-    kv_lengths: Optional[torch.Tensor] = None,
-) -> _mask_mod_signature:
-    """Generates mask mods that apply to inputs to flex attention in the sequence stacked
-    format.
-
-    Args:
-        mask_mod: The mask mod to apply to the documents
-        lengths: Lengths of each document
-
-    Note:
-        What is the sequence stacked format? When assembling batches of inputs, we
-        take multiple sequences and stack them together to form 1 large sequence. We then
-        use masking to ensure that the attention scores are only applied to tokens within
-        the same document.
-
-    Example:
-
-    - Square mask
-      doc_mask         lengths
-      a a b b b c c    2 3 2
-    a 1 0 0 0 0 0 0
-    a 1 1 0 0 0 0 0
-    b 0 0 1 0 0 0 0
-    b 0 0 1 1 0 0 0
-    b 0 0 1 1 1 0 0
-    c 0 0 0 0 0 1 0
-    c 0 0 0 0 0 1 1
-
-    """
-    kv_lengths = kv_lengths if kv_lengths is not None else lengths
-    q_document_id, q_token_id = lengths_to_local_ids(lengths)
-    kv_document_id, kv_token_id = lengths_to_local_ids(kv_lengths)
-    q_max_idx = lengths.sum() - 1
-    kv_max_idx = kv_lengths.sum() - 1
-
-    def doc_mask_mod(b, h, q_idx, kv_idx):
-        q_idx_cap = torch.minimum(q_max_idx, q_idx)
-        kv_idx_cap = torch.minimum(kv_max_idx, kv_idx)
-        valid_idx = (q_idx <= q_max_idx) & (kv_idx <= kv_max_idx)
-        same_doc = q_document_id[q_idx_cap] == kv_document_id[kv_idx_cap]
-        q_logical = q_token_id[q_idx_cap]
-        kv_logical = kv_token_id[kv_idx_cap]
-        inner_mask = mask_mod(b, h, q_logical, kv_logical)
-        return same_doc & inner_mask & valid_idx
-
-    return doc_mask_mod
-
-
-# Rotary embedding as in xformer, see if torchtrain implementation is not better. Also might be usefull to make it work with batch*seqlen collapsed.
 class RotaryEmbedding(torch.nn.Module):
     """
     RotaryEmbedding Module

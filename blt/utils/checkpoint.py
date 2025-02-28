@@ -4,10 +4,12 @@ import os
 import torch as pt
 import wandb
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 
-def save_checkpoint(model, optimizer, scheduler, step, checkpoint_dir, scaler=None, keep=3):
+def save_checkpoint(
+    model, optimizer, scheduler, step, checkpoint_dir, scaler=None, keep=3
+):
     """
     Saves a new checkpoint as 'checkpoint_latest.pt'. If a previous checkpoint_latest exists,
     it is renamed to include its step number (e.g. checkpoint_00500.pt). Then, only the last

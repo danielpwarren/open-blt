@@ -12,9 +12,9 @@ from typing import Any, Dict, Iterator, Optional, Tuple
 import numpy as np
 import torch as pt
 import torch.nn.functional as F
-from torch.amp import autocast, GradScaler
 import wandb
 from omegaconf import OmegaConf
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from blt.data.jsonl_dataset import JsonlDataset, JsonlValidationDataset
@@ -25,12 +25,13 @@ from blt.utils.checkpoint import save_checkpoint
 from blt.utils.logging import init_wandb, log_metrics, log_model_summary, setup_logging
 from blt.utils.optim import build_optimizer, get_cosine_schedule
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 
 
 @dataclass
 class TrainingState:
     """Maintains the state of a training run."""
+
     model: pt.nn.Module
     optimizer: pt.optim.Optimizer
     scheduler: Any
@@ -42,17 +43,17 @@ class TrainingState:
     global_bytes: int = 0
     start_time: float = 0.0
     last_log_time: float = 0.0
-    
+
     @property
     def avg_loss(self) -> float:
         """Calculate average loss over all steps."""
         return self.total_loss_sum / max(1, self.total_loss_count)
-    
+
     def update_loss_tracking(self, loss_val: float) -> None:
         """Update loss tracking statistics."""
         self.total_loss_sum += loss_val
         self.total_loss_count += 1
-    
+
     def update_byte_tracking(self, batch_bytes: int) -> None:
         """Update byte tracking statistics."""
         self.interval_bytes += batch_bytes
@@ -111,7 +112,7 @@ def get_next_batch(train_iter, train_loader, device):
     except StopIteration:
         train_iter = iter(train_loader)
         input_seq, target_seq = next(train_iter)
-    
+
     return train_iter, input_seq.to(device), target_seq.to(device)
 
 
@@ -122,7 +123,7 @@ def get_validation_batch(val_iter, val_loader, device):
     except StopIteration:
         val_iter = iter(val_loader)
         val_input, val_target = next(val_iter)
-    
+
     return val_iter, val_input.to(device), val_target.to(device)
 
 
@@ -135,10 +136,10 @@ def setup_training_state(config, model, device, total_steps, resume_path=None):
         total_steps=total_steps,
         lr_min_ratio=config.optim.lr_min_ratio,
     )
-    
+
     use_amp = getattr(config.optim, "use_amp", False)
     scaler = GradScaler() if use_amp else None
-    
+
     state = TrainingState(
         model=model,
         optimizer=optimizer,
@@ -146,9 +147,9 @@ def setup_training_state(config, model, device, total_steps, resume_path=None):
         step=0,
         scaler=scaler,
         start_time=time.time(),
-        last_log_time=time.time()
+        last_log_time=time.time(),
     )
-    
+
     if resume_path and os.path.isfile(resume_path):
         checkpoint = pt.load(resume_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -158,37 +159,41 @@ def setup_training_state(config, model, device, total_steps, resume_path=None):
         if use_amp and "scaler_state_dict" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
         logger.info(f"Resumed training from checkpoint at step {state.step}.")
-    
+
     return state
 
 
-def log_training_progress(state, config, metrics, step_time, data_load_time, total_steps):
+def log_training_progress(
+    state, config, metrics, step_time, data_load_time, total_steps
+):
     """Log training progress with metrics."""
     current_time = time.time()
     full_interval_time = current_time - state.last_log_time
     state.last_log_time = current_time
-    
+
     tokens_this_step = config.data.batch_size * config.data.seq_len
     tokens_processed = state.step * tokens_this_step
     wps = tokens_this_step / full_interval_time
-    
+
     # Calculate ETA
     elapsed_time = current_time - state.start_time
     remaining_steps = total_steps - state.step
     avg_step_time = elapsed_time / state.step if state.step > 0 else 0
     eta = remaining_steps * avg_step_time
     eta_str = str(datetime.timedelta(seconds=int(eta)))
-    
+
     # Add performance metrics
-    metrics.update({
-        "performance/wps": wps,
-        "performance/data_load_time": data_load_time,
-        "performance/step_time": step_time,
-        "performance/iter_time": full_interval_time,
-        "performance/eta": eta,
-        "performance/bytes": state.global_bytes,
-    })
-    
+    metrics.update(
+        {
+            "performance/wps": wps,
+            "performance/data_load_time": data_load_time,
+            "performance/step_time": step_time,
+            "performance/iter_time": full_interval_time,
+            "performance/eta": eta,
+            "performance/bytes": state.global_bytes,
+        }
+    )
+
     # Log to console
     logger_msg = (
         f"Step {state.step}: loss={metrics['train/loss']:.4f} "
@@ -206,16 +211,14 @@ def perform_training_step(state, input_seq, target_seq, config, device):
     """Perform a single training step."""
     t_step_start = time.time()
     state.optimizer.zero_grad()
-    
+
     use_amp = state.scaler is not None
-    
+
     # Use autocast for mixed precision training
     if use_amp:
         with autocast(device_type=device if device != "cpu" else None):
             logits = state.model(input_seq)
-            loss = F.cross_entropy(
-                logits.view(-1, config.model.vocab_size), target_seq.view(-1)
-            )
+            loss = state.model.cross_entropy(logits, target_seq)
 
         state.scaler.scale(loss).backward()
         state.scaler.unscale_(state.optimizer)
@@ -224,21 +227,19 @@ def perform_training_step(state, input_seq, target_seq, config, device):
         state.scaler.update()
     else:
         logits = state.model(input_seq)
-        loss = F.cross_entropy(
-            logits.view(-1, config.model.vocab_size), target_seq.view(-1)
-        )
+        loss = state.model.cross_entropy(logits, target_seq)
         loss.backward()
         pt.nn.utils.clip_grad_norm_(state.model.parameters(), config.optim.clip)
         state.optimizer.step()
-    
+
     state.scheduler.step()
     state.step += 1
     step_time = time.time() - t_step_start
-    
+
     # Update loss tracking
     loss_val = loss.item()
     state.update_loss_tracking(loss_val)
-    
+
     # Calculate gradient norm
     grad_norm = (
         sum(
@@ -247,24 +248,24 @@ def perform_training_step(state, input_seq, target_seq, config, device):
             if p.grad is not None
         )
     ) ** 0.5
-    
+
     return loss_val, step_time, grad_norm
 
 
-def validate_model(state, val_loader, device, config, tokenizer):
+def validate_model(state, val_loader, device, config, tokenizer, val_table):
     """Run validation on the entire validation set and generate sample text."""
     state.model.eval()
-    
+
     # Validate on entire validation set
     total_val_loss = 0.0
     total_val_samples = 0
     use_amp = state.scaler is not None
-    
+
     with pt.no_grad():
         for val_input, val_target in val_loader:
             val_input = val_input.to(device)
             val_target = val_target.to(device)
-            
+
             if use_amp:
                 with autocast(device_type=device if device != "cpu" else None):
                     val_logits = state.model(val_input)
@@ -278,27 +279,24 @@ def validate_model(state, val_loader, device, config, tokenizer):
                     val_logits.view(-1, config.model.vocab_size),
                     val_target.view(-1),
                 )
-            
+
             batch_size = val_input.size(0)
             total_val_loss += val_loss.item() * batch_size
             total_val_samples += batch_size
-    
+
     # Calculate average loss across all validation samples
     avg_val_loss = total_val_loss / total_val_samples
     val_bpb = calculate_bpb(avg_val_loss)
-    
-    # Generate sample starting with just BOS token
-    val_table = wandb.Table(columns=["step", "response"])
-    
+
     # Generate from BOS token only
     prompt_tokens = pt.tensor([[tokenizer.bos_id]], dtype=pt.long, device=device)
     gen_tokens = generate_text_sample(
         state.model, prompt_tokens, max_new_tokens=256, temperature=1.0, device=device
     )
     response = tokenizer.decode(gen_tokens[0].tolist())
-    
+
     val_table.add_data(state.step, response)
-    
+
     # Log validation metrics
     metrics = {
         "validation/loss": avg_val_loss,
@@ -309,22 +307,35 @@ def validate_model(state, val_loader, device, config, tokenizer):
     logger.info(
         f"Validation step {state.step}: loss={avg_val_loss:.4f}, bpb={val_bpb:.4f} (full validation set)"
     )
-    
+
     state.model.train()
     return avg_val_loss
 
 
-def train_model(config, model, train_loader, val_loader, tokenizer, checkpoint_dir, total_steps, device):
+def train_model(
+    config,
+    model,
+    train_loader,
+    val_loader,
+    tokenizer,
+    checkpoint_dir,
+    total_steps,
+    device,
+):
     """Main training loop with modular components."""
     # Initialize training state
     state = setup_training_state(
-        config, 
-        model, 
-        device, 
-        total_steps, 
-        resume_path=config.checkpoint.resume_from if hasattr(config.checkpoint, "resume_from") else None
+        config,
+        model,
+        device,
+        total_steps,
+        resume_path=(
+            config.checkpoint.resume_from
+            if hasattr(config.checkpoint, "resume_from")
+            else None
+        ),
     )
-    
+
     # Skip batches if resuming
     train_iter = iter(train_loader)
     if state.step > 0:
@@ -336,11 +347,11 @@ def train_model(config, model, train_loader, val_loader, tokenizer, checkpoint_d
             except StopIteration:
                 train_iter = iter(train_loader)
         logger.info(f"Skipped {skip_count} batches to resume at batch #{skip_count}.")
-    
+
     # Configuration values
     log_freq = config.logging.log_freq
     val_interval = config.training.val_interval
-    
+
     # Calculate model constants for metrics
     total_params = count_parameters(model)
     embed_params = config.model.vocab_size * config.model.dim
@@ -351,33 +362,35 @@ def train_model(config, model, train_loader, val_loader, tokenizer, checkpoint_d
         config.model.dim,
         config.data.seq_len,
     )
-    
+
     # Main training loop
     while state.step < total_steps:
         # Fetch batch
         t_fetch_start = time.time()
-        train_iter, input_seq, target_seq = get_next_batch(train_iter, train_loader, device)
+        train_iter, input_seq, target_seq = get_next_batch(
+            train_iter, train_loader, device
+        )
         data_load_time = time.time() - t_fetch_start
-        
+
         # Track batch size in bytes
         batch_bytes = input_seq.numel()
         state.update_byte_tracking(batch_bytes)
-        
+
         # Perform training step
         loss_val, step_time, grad_norm = perform_training_step(
             state, input_seq, target_seq, config, device
         )
-        
+
         # Log progress periodically
         if state.step % log_freq == 0:
             current_lr = state.scheduler.get_last_lr()[0]
             bpb = calculate_bpb(loss_val)
             avg_bpb = calculate_bpb(state.avg_loss)
-            
+
             # Calculate tokens and estimated FLOPs
             tokens_processed = state.step * config.data.batch_size * config.data.seq_len
             estimated_flops = tokens_processed * constant_flops_per_token
-            
+
             metrics = {
                 "train/grad_norm": grad_norm,
                 "train/loss": loss_val,
@@ -387,9 +400,11 @@ def train_model(config, model, train_loader, val_loader, tokenizer, checkpoint_d
                 "train/lr": current_lr,
                 "performance/estimated_flops": estimated_flops,
             }
-            
-            log_training_progress(state, config, metrics, step_time, data_load_time, total_steps)
-        
+
+            log_training_progress(
+                state, config, metrics, step_time, data_load_time, total_steps
+            )
+
         # Save checkpoint periodically
         if state.step % config.checkpoint.dump.every == 0:
             save_checkpoint(
@@ -401,21 +416,21 @@ def train_model(config, model, train_loader, val_loader, tokenizer, checkpoint_d
                 state.scaler,
                 config.checkpoint.dump.keep,
             )
-        
+
         # Run validation periodically
         if state.step % val_interval == 0:
             validate_model(state, val_loader, device, config, tokenizer)
-    
+
     # Log final statistics
     final_elapsed = time.time() - state.start_time
     final_tokens = state.step * config.data.batch_size * config.data.seq_len
     final_estimated_flops = final_tokens * constant_flops_per_token
-    
+
     logger.info(f"Training complete in {final_elapsed:.2f} seconds.")
     logger.info(f"Total tokens processed: {final_tokens}")
     logger.info(f"Total estimated FLOPs: {final_estimated_flops:.2e}")
     logger.info(f"Total bytes processed: {state.global_bytes}")
-    
+
     return state
 
 
@@ -427,7 +442,7 @@ def calculate_total_steps(config, train_dataset):
         "seq_len": config.data.seq_len,
         "batch_size": config.data.batch_size,
     }
-    
+
     if os.path.exists(steps_cache_file):
         with open(steps_cache_file, "r") as f:
             cache = json.load(f)
@@ -439,12 +454,12 @@ def calculate_total_steps(config, train_dataset):
                 logger.info("Config changed, recalculating total steps...")
     else:
         logger.info("Calculating total steps for the first time...")
-    
+
     total_steps = train_dataset.calculate_total_steps(config.data.batch_size)
     os.makedirs(config.dump_dir, exist_ok=True)
     with open(steps_cache_file, "w") as f:
         json.dump({"config": cache_config, "total_steps": total_steps}, f)
-    
+
     return total_steps
 
 
@@ -474,7 +489,7 @@ def main():
         device = args.device
     else:
         device = "cuda" if pt.cuda.is_available() else "cpu"
-    
+
     logger.info(f"Using device: {device}")
 
     # Load and merge configuration
@@ -498,6 +513,8 @@ def main():
     init_wandb(config)
     logger.info(f"Run name: {config.name}")
 
+    val_table = wandb.Table(columns=["step", "response"])
+
     # Set random seed
     seed_everything(config.seed)
 
@@ -511,13 +528,13 @@ def main():
         shuffle_files=True,
         seed=config.seed,
     )
-    
+
     val_dataset = JsonlValidationDataset(
         val_file=config.data.val_file,
         seq_len=config.data.seq_len,
         max_samples=config.data.max_val_samples,
     )
-    
+
     # Calculate total steps
     total_steps = calculate_total_steps(config, train_dataset)
     logger.info(f"Total training steps: {total_steps}")
@@ -528,27 +545,27 @@ def main():
         batch_size=config.data.batch_size,
         num_workers=config.data.workers,
     )
-    
-    val_batch_size = 8  # Small fixed batch size for quick validation
+
+    val_batch_size = getattr(config.data, "val_batch_size", 1)
     val_loader = DataLoader(
-        val_dataset, batch_size=val_batch_size, shuffle=True, num_workers=1
+        val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=1
     )
 
     # Create model
     model = EntropyModel(config).to(device)
     logger.info(f"Model: {model}")
-    
+
     # Enable dynamo compilation if configured
     if getattr(config.optim, "enable_dynamo", False):
         logger.info("Torch Dynamo enabled: compiling model...")
         model = pt.compile(model)
-    
+
     # Log model summary
     log_model_summary(model)
     param_count = count_parameters(model)
     logger.info(f"Model parameter count: {param_count}")
     wandb.run.summary["param_count"] = param_count
-    
+
     # Log initial generation before training
     logger.info("Generating initial sample before training...")
     model.eval()
@@ -557,17 +574,25 @@ def main():
         model, prompt_tokens, max_new_tokens=256, temperature=1.0, device=device
     )
     response = tokenizer.decode(gen_tokens[0].tolist())
-    
-    val_table = wandb.Table(columns=["step", "response"])
+
     val_table.add_data(0, response)
     metrics = {"samples": val_table}
     wandb.log(metrics, step=0)
     logger.info("Initial generation complete. Starting training...")
     model.train()
-    
+
     # Train model
-    train_model(config, model, train_loader, val_loader, tokenizer, checkpoint_dir, total_steps, device)
-    
+    train_model(
+        config,
+        model,
+        train_loader,
+        val_loader,
+        tokenizer,
+        checkpoint_dir,
+        total_steps,
+        device,
+    )
+
     # Clean up
     if wandb.run is not None:
         wandb.finish()

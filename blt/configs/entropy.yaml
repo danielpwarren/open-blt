@@ -25,15 +25,14 @@ model:
   attn_impl: "xformers"   # Options include "xformers", "sdpa", etc.
   attn_bias_type: "local_block_causal"
   sliding_window: 512     # Set to null if not using sliding-window attention
-  weight_tying: false
 
 data:
   train_dir: "./data/train"  # Directory containing training files
   val_file: "./data/val.jsonl"  # Validation file path
   seq_len: 4096
   batch_size: 6
+  val_batch_size: 12
   workers: 8
-  max_val_samples: 4  # Maximum number of validation samples to load
 
 optim:
   lr: 4e-4

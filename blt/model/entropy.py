@@ -12,7 +12,6 @@ class EntropyModel(nn.Module):
 
         transformer_args_dict = OmegaConf.to_container(config.model, resolve=True)
         transformer_args_dict["max_seqlen"] = config.data.seq_len
-        transformer_args_dict["weight_tying"] = False
         transformer_args_dict["sliding_window"] = transformer_args_dict.get(
             "sliding_window", None
         )
