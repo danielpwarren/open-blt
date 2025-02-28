@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch as pt
 import torch.nn as nn
 from omegaconf import OmegaConf
@@ -33,5 +35,9 @@ class EntropyModel(nn.Module):
                 module.weight, mean=0.0, std=0.02, a=-3 * 0.02, b=3 * 0.02
             )
 
-    def forward(self, x):
-        return self.transformer(x)
+    def forward(
+        self,
+        token_values: pt.Tensor,
+        target: Optional[pt.Tensor] = None,
+    ):
+        return self.transformer(token_values, target=target)

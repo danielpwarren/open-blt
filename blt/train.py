@@ -12,11 +12,11 @@ from typing import Any, Dict, Iterator, Optional, Tuple
 import numpy as np
 import torch as pt
 import torch.nn.functional as F
-import wandb
 from omegaconf import OmegaConf
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
+import wandb
 from blt.data.jsonl_dataset import JsonlDataset, JsonlValidationDataset
 from blt.model.common import get_num_flop_per_token
 from blt.model.entropy import EntropyModel
@@ -217,8 +217,7 @@ def perform_training_step(state, input_seq, target_seq, config, device):
     # Use autocast for mixed precision training
     if use_amp:
         with autocast(device_type=device if device != "cpu" else None):
-            logits = state.model(input_seq)
-            loss = state.model.cross_entropy(logits, target_seq)
+            loss = state.model(input_seq, target_seq)
 
         state.scaler.scale(loss).backward()
         state.scaler.unscale_(state.optimizer)
@@ -226,8 +225,7 @@ def perform_training_step(state, input_seq, target_seq, config, device):
         state.scaler.step(state.optimizer)
         state.scaler.update()
     else:
-        logits = state.model(input_seq)
-        loss = state.model.cross_entropy(logits, target_seq)
+        loss = state.model(input_seq, target_seq)
         loss.backward()
         pt.nn.utils.clip_grad_norm_(state.model.parameters(), config.optim.clip)
         state.optimizer.step()
@@ -526,13 +524,14 @@ def main():
         data_dir=config.data.train_dir,
         seq_len=config.data.seq_len,
         shuffle_files=True,
+        tokenizer=tokenizer,
         seed=config.seed,
     )
 
     val_dataset = JsonlValidationDataset(
         val_file=config.data.val_file,
         seq_len=config.data.seq_len,
-        max_samples=config.data.max_val_samples,
+        tokenizer=tokenizer,
     )
 
     # Calculate total steps

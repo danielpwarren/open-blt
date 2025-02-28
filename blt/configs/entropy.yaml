@@ -1,5 +1,5 @@
 seed: 42
-name: "blt-entropy-fine_web_edu-not"
+name: "blt-entropy"
 dump_dir: "./checkpoints"
 
 training:
@@ -45,12 +45,12 @@ optim:
   enable_dynamo: false
 
 logging:
-  wandb_project: "open-blt"
+  wandb_project: "megabyte"
   log_freq: 1
-  wandb_run_id: ""  # Set this to a specific run ID to resume, or leave blank for a new run
+  wandb_run_id: "rabnbu0v"  # Set this to a specific run ID to resume, or leave blank for a new run
 
 checkpoint:
   dump:
     every: 1000
     keep: 3
-  resume_from: ""  # Provide path to checkpoint file to resume training, or leave blank to start fresh
+  resume_from: "checkpoints/blt-entropy/checkpoint_latest.pt"  # Provide path to checkpoint file to resume training, or leave blank to start fresh
