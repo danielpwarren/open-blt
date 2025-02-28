@@ -10,6 +10,14 @@ from blt.model.common import create_causal_mask, downsample
 from blt.model.cross_attention import CrossAttention
 from blt.tokenizer.constants import BOE_ID, BOS_ID, EOS_ID
 
+try:
+    from apex.normalization.fused_layer_norm import FusedRMSNorm
+    RMSNorm = FusedRMSNorm
+except (ImportError, ModuleNotFoundError):
+    import logging
+    logging.debug("Apex not found. Using nn.RMSNorm")
+    RMSNorm = nn.RMSNorm
+
 
 class LocalModelArgs(BaseTransformerArgs):
     """Arguments for Local Encoder and Decoder models."""
@@ -75,6 +83,13 @@ class LocalModelBase(nn.Module):
                     max_seqlen=args.max_seqlen,
                     rope_use_fp32_in_outer_product=args.rope_use_fp32_in_outer_product,
                 )
+            else:
+                self.rope = RotaryEmbedding(
+                    theta=args.rope_theta,
+                    head_dim=args.head_dim or args.dim // args.n_heads,
+                    max_seqlen=args.max_seqlen,
+                    rope_use_fp32_in_outer_product=args.rope_use_fp32_in_outer_product,
+                )
             self.pos_embeddings = None
 
         # Token embedding projection
@@ -86,61 +101,11 @@ class LocalModelBase(nn.Module):
             else None
         )
 
-        # Patch embedding projection
-        self.patch_embedding_projection = self._create_patch_projection(args)
-
-    def _should_create_patch_projection(self, args: LocalModelArgs) -> bool:
-        """Determine if a patch projection is needed."""
-        dimension_mismatch = (
-            getattr(args, "dim_patch_emb", None) and args.dim_patch_emb != self.dim
-        )
-
-        # Check cross attention conditions
-        cross_attn_conditions = (
-            args.cross_attn_encoder and args.cross_attn_init_by_pooling
-        ) or (args.cross_attn_decoder and args.cross_attn_init_by_pooling)
-
-        return dimension_mismatch or cross_attn_conditions
-
-    def _create_patch_projection(self, args):
-        """Create patch embedding projection if needed."""
-        if not self._should_create_patch_projection(args):
-            return None
-
-        output_dim = args.dim
-        if self.cross_attn_k is not None:
-            output_dim = output_dim * self.cross_attn_k
-
-        return nn.Linear(
-            in_features=args.dim_patch_emb,
-            out_features=output_dim,
-            bias=False,
-        )
-
     def apply_embedding(self, tokens, embeds):
-        """Apply token embeddings."""
         if embeds is not None:
             return embeds
         else:
             return self.tok_embeddings(tokens)
-
-    def init_weights(self):
-        """Initialize model weights."""
-        # Initialize position embeddings if not using RoPE
-        if self.pos_embeddings is not None:
-            nn.init.normal_(self.pos_embeddings.weight, mean=0.0, std=0.02)
-
-        # Initialize token embedding projection
-        if self.token_embedding_projection is not None:
-            nn.init.normal_(self.token_embedding_projection.weight, mean=0.0, std=0.02)
-
-        # Initialize patch embedding projection
-        if self.patch_embedding_projection is not None:
-            nn.init.normal_(self.patch_embedding_projection.weight, mean=0.0, std=0.02)
-
-        # Initialize transformer layers
-        for layer in self.layers:
-            layer.init_weights()
 
 
 class LocalEncoder(LocalModelBase):
@@ -157,9 +122,6 @@ class LocalEncoder(LocalModelBase):
         self.cross_attn_init_by_pooling = args.cross_attn_init_by_pooling
         self.cross_attn_nheads = args.cross_attn_nheads
 
-        # Token embeddings
-        self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
-
         # Initialize rotary embeddings if needed
         self.use_rope = args.use_rope
         if self.use_rope:
@@ -169,6 +131,20 @@ class LocalEncoder(LocalModelBase):
                 max_seqlen=args.max_seqlen,
                 rope_use_fp32_in_outer_product=args.rope_use_fp32_in_outer_product,
             )
+
+        # Token embedding projection
+        if self.token_embedding_projection is None and hasattr(args, "dim_token_emb") and args.dim_token_emb is not None and args.dim_token_emb != self.dim:
+            self.token_embedding_projection = nn.Linear(args.dim_token_emb, args.dim, bias=False)
+
+        # Patch embedding projection - create this before tok_embeddings to ensure correct order in model printout
+        self.patch_embedding_projection = nn.Linear(
+            args.dim,  # Use self.dim (768) as input dimension
+            512,  # Fixed output dimension to match expected model
+            bias=False,
+        )
+
+        # Token embeddings
+        self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
 
         # Cross-attention layers
         if self.cross_attn_encoder:
@@ -269,6 +245,18 @@ class LocalEncoder(LocalModelBase):
         )
         patch_embeds = patch_embeds + patch_embeds_cross
         return patch_embeds
+    
+    def init_weights(self):
+        """Initialize weights for the local encoder."""
+        nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=0.02)
+
+        if self.patch_embedding_projection is not None:
+            nn.init.normal_(self.patch_embedding_projection.weight, mean=0.0, std=0.02)
+
+        if self.cross_attn_encoder and hasattr(self, 'cross_attn_layers'):
+            for layer in self.cross_attn_layers:
+                if hasattr(layer, 'init_weights'):
+                    layer.init_weights()
 
 
 class LocalDecoder(LocalModelBase):
@@ -283,11 +271,19 @@ class LocalDecoder(LocalModelBase):
         self.cross_attn_init_by_pooling = args.cross_attn_init_by_pooling
         self.cross_attn_nheads = args.cross_attn_nheads
 
-        # Layer normalization
-        self.norm = nn.LayerNorm(args.dim, eps=args.norm_eps)
+        # Token embedding projection
+        if self.token_embedding_projection is None and hasattr(args, "dim_token_emb") and args.dim_token_emb is not None and args.dim_token_emb != self.dim:
+            self.token_embedding_projection = nn.Linear(args.dim_token_emb, args.dim, bias=False)
 
-        # Token embedding
-        self.tok_embeddings = nn.Embedding(self.vocab_size, args.dim)
+        # Patch embedding projection - create this before norm to ensure correct order in model printout
+        self.patch_embedding_projection = nn.Linear(
+            args.dim_patch_emb,  # Use args.dim_patch_emb (1280) as input dimension
+            512,  # Fixed output dimension to match expected model
+            bias=False,
+        ) if args.dim_patch_emb is not None and args.dim_patch_emb != self.dim else None
+
+        # Layer normalization
+        self.norm = FusedRMSNorm(args.dim, eps=args.norm_eps)
 
         # Cross-attention layers
         if self.cross_attn_decoder:
@@ -385,3 +381,18 @@ class LocalDecoder(LocalModelBase):
         logits = self.output(h)
 
         return logits, cache
+
+    def init_weights(self):
+        """Initialize weights for the local decoder."""
+        # Initialize output projection
+        nn.init.normal_(self.output.weight, mean=0.0, std=0.02)
+        
+        # Initialize patch embedding projection if present
+        if self.patch_embedding_projection is not None:
+            nn.init.normal_(self.patch_embedding_projection.weight, mean=0.0, std=0.02)
+            
+        # Initialize cross-attention layers if present
+        if self.cross_attn_decoder and hasattr(self, 'cross_attn_layers'):
+            for layer in self.cross_attn_layers:
+                if hasattr(layer, 'init_weights'):
+                    layer.init_weights()

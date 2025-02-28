@@ -1,0 +1,67 @@
+seed: 42
+name: "blt-model"
+model_type: "blt"
+dump_dir: "./checkpoints"
+training:
+  val_interval: 1000  # How often to run a validation-generation step
+model:
+  # BLT architecture parameters
+  vocab_size: 260  # 256 bytes + reserved tokens (BOS/EOS and extras)
+  dim_global: 1280
+  dim_local_encoder: 768
+  dim_local_decoder: 768
+  n_heads_global: 10
+  n_heads_local_encoder: 12
+  n_heads_local_decoder: 12
+  n_layers_global: 24
+  n_layers_local_encoder: 1
+  n_layers_local_decoder: 7
+  # Patching configuration
+  patch_size: 6
+  patching_mode: "space"
+  patching_threshold: 3.14
+  max_patch_length: null
+  # Encoder/Decoder configuration
+  max_encoder_seq_length: 1024
+  share_encoder_decoder_emb: true
+  # Cross attention configurations
+  cross_attn_encoder: true
+  cross_attn_decoder: true
+  cross_attn_k: 2
+  cross_attn_nheads: 10
+  cross_attn_all_layers_decoder: true
+  cross_attn_all_layers_encoder: true
+  cross_attn_init_by_pooling: true
+  # Additional model configurations
+  downsampling_by_pooling: "max"
+  use_rope: true
+  dropout: 0.0
+  attn_impl: "xformers"
+  attn_bias_type: "block_causal"
+  max_seqlen: 1024
+data:
+  train_dir: "./data/train"  # Directory containing training files
+  val_file: "./data/val.jsonl"  # Validation file path
+  seq_len: 4096
+  batch_size: 4
+  val_batch_size: 8
+  workers: 8
+optim:
+  lr: 4e-4
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  clip: 10.0
+  warmup: 500
+  lr_min_ratio: 0.1
+  enable_dynamo: false
+  use_amp: true
+logging:
+  wandb_project: "blt-training"
+  log_freq: 10
+  wandb_run_id: ""  # Set this to a specific run ID to resume, or leave blank for a new run
+checkpoint:
+  dump:
+    every: 1000
+    keep: 3
+  resume_from: ""  # Provide path to checkpoint file to resume training, or leave blank to start fresh

@@ -3,8 +3,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from blt.model.base_transformer import BaseTransformer, BaseTransformerArgs
+from blt.model.base_transformer import BaseTransformerArgs
 from blt.model.common import cross_attn_mask, downsample, patch_ids_from_lengths
+from blt.model.global_transformer import GlobalTransformer
 from blt.model.local_models import LocalDecoder, LocalEncoder, LocalModelArgs
 from blt.tokenizer.constants import BOE_ID, BOS_ID, EOS_ID, PAD_ID
 
@@ -14,17 +15,18 @@ class ByteLatentTransformerArgs(BaseTransformerArgs):
 
     # Basic model configuration
     vocab_size: int = 260  # 256 + 4 special tokens
-    dim: int = 512
-    n_heads: int = 8
+    n_heads_global: int = 10
+    n_heads_local_encoder: int = 12
+    n_heads_local_decoder: int = 12
 
     # Architecture and dimensions
     dim_token: Optional[int] = None
-    dim_global: int = 512
-    dim_local_decoder: int = 512
-    dim_local_encoder: int = 512
-    n_layers_global: int = 8
-    n_layers_local_decoder: int = 4
-    n_layers_local_encoder: int = 4
+    dim_global: int = 1280
+    dim_local_decoder: int = 768
+    dim_local_encoder: int = 768
+    n_layers_global: int = 24
+    n_layers_local_decoder: int = 7
+    n_layers_local_encoder: int = 1
 
     # Tokenization and patching
     patch_size: float = 4
@@ -38,15 +40,15 @@ class ByteLatentTransformerArgs(BaseTransformerArgs):
     max_encoder_seq_length: Optional[int] = None
 
     # Cross attention configurations
-    cross_attn_encoder: bool = False
-    cross_attn_decoder: bool = False
+    cross_attn_encoder: bool = True
+    cross_attn_decoder: bool = True
     cross_attn_window_encoder: Optional[int] = None
     cross_attn_window_decoder: Optional[int] = None
-    cross_attn_k: Optional[int] = None
-    cross_attn_nheads: Optional[int] = 4
-    cross_attn_all_layers_decoder: bool = False
-    cross_attn_all_layers_encoder: bool = False
-    cross_attn_init_by_pooling: bool = False
+    cross_attn_k: Optional[int] = 2
+    cross_attn_nheads: Optional[int] = 10
+    cross_attn_all_layers_decoder: bool = True
+    cross_attn_all_layers_encoder: bool = True
+    cross_attn_init_by_pooling: bool = True
 
     # Model behavior and optimization
     downsampling_by_pooling: Optional[str] = None
@@ -55,6 +57,11 @@ class ByteLatentTransformerArgs(BaseTransformerArgs):
 
     # Additional configurations
     share_encoder_decoder_emb: bool = True
+    
+    # Hash embedding configurations
+    encoder_hash_byte_group_size: Optional[int] = None
+    encoder_hash_byte_group_vocab: int = 50002
+    encoder_hash_byte_group_nb_functions: int = 3
 
 
 def get_blt_input(
@@ -63,50 +70,46 @@ def get_blt_input(
     boe_id: int,
 ):
     """
-    Prepare input tokens for BLT model.
-
+    Prepare input tokens for the BLT model.
+    
     Args:
         tokens: Input tokens [batch_size, seq_len]
-        nb_boe: Number of BOE tokens to add
+        nb_boe: Number of BOE tokens to prepend
         boe_id: BOE token ID
-
+        
     Returns:
-        Tuple of (local_encoder_tokens, local_decoder_tokens)
+        Tuple of (encoder_tokens, decoder_tokens)
     """
     batch_size, seq_len = tokens.shape
-    local_encoder_tokens = local_decoder_tokens = tokens
+    local_encoder_tokens = tokens
+    local_decoder_tokens = tokens
 
-    # Add BOE tokens to the beginning of the sequence for encoder
     if nb_boe > 0:
-        padded_patch = tokens.new_full((batch_size, nb_boe), boe_id)
+        padded_patch = tokens.new(batch_size, nb_boe).fill_(boe_id)
         local_encoder_tokens = torch.cat((padded_patch, local_encoder_tokens), dim=1)
 
     return local_encoder_tokens, local_decoder_tokens
 
 
-def decoder_patch_ids_from_lengths(patch_lengths, nb_boe, seq_len):
+def decoder_patch_ids_from_lengths(
+    patch_lengths: torch.Tensor, nb_boe: int, seq_len: int
+):
     """
-    Generate decoder patch IDs from patch lengths.
-
+    Generate patch IDs for the decoder from patch lengths.
+    
     Args:
         patch_lengths: Patch lengths [batch_size, num_patches]
         nb_boe: Number of BOE tokens
         seq_len: Sequence length
-
+        
     Returns:
         Decoder patch IDs [batch_size, seq_len]
     """
-    # Skip the first patch (which contains BOE tokens)
-    if nb_boe > 0:
-        decoder_patch_lengths = patch_lengths[:, 1:]
-    else:
-        decoder_patch_lengths = patch_lengths
-
-    # Generate patch IDs for decoder
+    first_patch_length = patch_lengths[:, 0].clone()
+    decoder_patch_lengths = patch_lengths[:, 1:].clone()
     decoder_patch_ids = patch_ids_from_lengths(
         patch_lengths=decoder_patch_lengths, seq_len=seq_len
     )
-
     return decoder_patch_ids
 
 
@@ -146,10 +149,10 @@ class ByteLatentTransformer(nn.Module):
         encoder_args = LocalModelArgs(
             dim=args.dim_local_encoder,
             n_layers=args.n_layers_local_encoder,
-            n_heads=args.n_heads,
+            n_heads=args.n_heads_local_encoder,
             head_dim=getattr(args, "head_dim", None),
-            dim_token_emb=args.dim_token,
-            dim_patch_emb=args.dim_global if args.cross_attn_encoder else None,
+            dim_token_emb=256,  # Token embedding dimension
+            dim_patch_emb=args.dim_local_encoder,  # Use local encoder dim instead of global dim
             dropout=args.dropout,
             vocab_size=args.vocab_size,
             patch_size=args.patch_size,
@@ -178,7 +181,7 @@ class ByteLatentTransformer(nn.Module):
         global_args = BaseTransformerArgs(
             dim=args.dim_global,
             n_layers=args.n_layers_global,
-            n_heads=args.n_heads,
+            n_heads=args.n_heads_global,
             head_dim=getattr(args, "head_dim", None),
             max_seqlen=args.max_encoder_seq_length or 4096,
             attn_impl=getattr(args, "attn_impl", "sdpa"),
@@ -188,17 +191,16 @@ class ByteLatentTransformer(nn.Module):
             ),
             norm_eps=getattr(args, "norm_eps", 1e-5),
             eos_id=EOS_ID,
+            dim_token_emb=512,  # Patch embedding dimension
         )
 
         # Create LocalDecoder args
         decoder_args = LocalModelArgs(
             dim=args.dim_local_decoder,
             n_layers=args.n_layers_local_decoder,
-            n_heads=args.n_heads,
+            n_heads=args.n_heads_local_decoder,
             head_dim=getattr(args, "head_dim", None),
-            dim_token_emb=(
-                args.dim_local_encoder if args.dim_token is None else args.dim_token
-            ),
+            dim_token_emb=256,  # Token embedding dimension
             dim_patch_emb=args.dim_global,
             dropout=args.dropout,
             vocab_size=args.vocab_size,
@@ -224,12 +226,17 @@ class ByteLatentTransformer(nn.Module):
 
         # Initialize model components
         self.local_encoder = LocalEncoder(encoder_args)
-        self.global_transformer = BaseTransformer(global_args)
+        self.global_transformer = GlobalTransformer(global_args)
         self.local_decoder = LocalDecoder(decoder_args)
+        
+        # Initialize hash token embeddings
+        self.encoder_hash_tok_embedding = nn.ModuleList(
+            [nn.Embedding(args.encoder_hash_byte_group_vocab, args.dim_local_encoder) 
+             for _ in range(args.encoder_hash_byte_group_nb_functions)]
+        )
 
-        # Tie encoder and decoder embeddings if specified
-        if args.share_encoder_decoder_emb:
-            self.local_decoder.tok_embeddings = self.local_encoder.tok_embeddings
+        # Do not tie encoder and decoder embeddings
+        # self.local_decoder.tok_embeddings = self.local_encoder.tok_embeddings
 
     def forward(
         self,
@@ -309,7 +316,8 @@ class ByteLatentTransformer(nn.Module):
                     global_tokens[row, pid] = self.eos_id
 
         h, _ = self.global_transformer(
-            h,
+            tokens=global_tokens,
+            embeds=h,
             mask="causal",
         )
 
@@ -357,3 +365,8 @@ class ByteLatentTransformer(nn.Module):
         self.local_encoder.init_weights()
         self.global_transformer.init_weights()
         self.local_decoder.init_weights()
+        
+        # Initialize hash token embeddings if present
+        if self.encoder_hash_tok_embedding is not None:
+            for embedding in self.encoder_hash_tok_embedding:
+                nn.init.normal_(embedding.weight, mean=0.0, std=0.02)

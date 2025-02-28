@@ -1,7 +1,6 @@
 import json
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import numpy as np
@@ -85,7 +84,39 @@ class JsonlDataset(IterableDataset):
                     except Exception as e:
                         print(f"Error processing line in {file_path}: {e}")
                         continue
-
+    
+    def calculate_total_steps(self, batch_size: int) -> int:
+        # Since all files are the same length, we only need to count sequences in one file
+        def count_sequences_in_file(file_path: str) -> int:
+            count = 0
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            data = json.loads(line)
+                            text = data.get('text', '')
+                            if not text:
+                                continue
+                            # Calculate number of sequences this text will generate
+                            tokens = self._get_tokens_from_text(text)
+                            n_sequences = len(tokens) // self.seq_len
+                            count += n_sequences
+                        except Exception as e:
+                            print(f"Error counting sequences in {file_path}: {e}")
+                            continue
+            except Exception as e:
+                print(f"Error reading file {file_path}: {e}")
+            return count
+        
+        # Count sequences in the first file
+        if not self.file_paths:
+            return 0
+        
+        # Get count from the first file and multiply by the number of files
+        sequences_per_file = count_sequences_in_file(self.file_paths[0])
+        total_sequences = sequences_per_file * len(self.file_paths)
+        
+        return total_sequences // batch_size
 
 class JsonlValidationDataset(Dataset):
     def __init__(
@@ -126,33 +157,3 @@ class JsonlValidationDataset(Dataset):
     def __getitem__(self, idx):
         seq = self.sequences[idx]
         return seq[:-1], seq[1:]
-
-
-def calculate_total_steps(self, batch_size: int) -> int:
-        def count_sequences_in_file(file_path: str) -> int:
-            count = 0
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        try:
-                            data = json.loads(line)
-                            text = data.get('text', '')
-                            if not text:
-                                continue
-                            # Calculate number of sequences this text will generate
-                            tokens = self._get_tokens_from_text(text)
-                            n_sequences = len(tokens) // self.seq_len
-                            count += n_sequences
-                        except Exception as e:
-                            print(f"Error counting sequences in {file_path}: {e}")
-                            continue
-            except Exception as e:
-                print(f"Error reading file {file_path}: {e}")
-            return count
-
-        total_sequences = 0
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            results = executor.map(count_sequences_in_file, self.file_paths)
-            total_sequences = sum(results)
-
-        return total_sequences // batch_size

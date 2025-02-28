@@ -63,6 +63,9 @@ class BaseTransformerArgs(BaseModel):
     attn_bias_type: str | None = None
     # Special token config
     eos_id: int | None = EOS_ID
+    
+    # Token embedding dimension
+    dim_token_emb: int | None = None
 
 
 def cross_entropy(pred, target, **kwargs):

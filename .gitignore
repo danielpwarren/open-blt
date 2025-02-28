@@ -180,3 +180,4 @@ checkpoints
 *.bin
 data
 *.jsonl
+!*/data

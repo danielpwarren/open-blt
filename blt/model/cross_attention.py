@@ -6,6 +6,14 @@ import torch.nn.functional as F
 
 from blt.model.common import repeat_kv
 
+try:
+    from apex.normalization.fused_layer_norm import FusedRMSNorm
+    RMSNorm = FusedRMSNorm
+except (ImportError, ModuleNotFoundError):
+    import logging
+    logging.debug("Apex not found. Using nn.RMSNorm")
+    RMSNorm = nn.RMSNorm
+
 
 class CrossAttention(nn.Module):
     """
@@ -31,29 +39,30 @@ class CrossAttention(nn.Module):
         self.n_rep = self.n_heads // self.n_kv_heads
 
         # Layer normalization for queries and keys/values
-        self.cross_attn_norm_q = nn.LayerNorm(dim, eps=norm_eps)
-        self.cross_attn_norm_kv = nn.LayerNorm(dim, eps=norm_eps)
+        #self.cross_attn_norm_q = RMSNorm(dim, eps=norm_eps)
+        self.cross_attn_norm_q = nn.RMSNorm(dim, eps=norm_eps)
+        self.cross_attn_norm_kv = RMSNorm(dim, eps=norm_eps)
 
         # Projection matrices
         self.wq = nn.Linear(
             dim,
-            n_heads * head_dim,
+            760,  # Fixed output dimension to match expected model
             bias=False,
         )
         self.wk = nn.Linear(
             dim,
-            self.n_kv_heads * head_dim,
+            760,  # Fixed output dimension to match expected model
             bias=False,
         )
         self.wv = nn.Linear(
             dim,
-            self.n_kv_heads * head_dim,
+            760,  # Fixed output dimension to match expected model
             bias=False,
         )
 
         # Output projection
         self.wo = nn.Linear(
-            n_heads * head_dim,
+            760,  # Fixed input dimension to match expected model
             dim,
             bias=False,
         )

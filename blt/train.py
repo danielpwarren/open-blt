@@ -18,8 +18,11 @@ from torch.utils.data import DataLoader
 
 import wandb
 from blt.data.jsonl_dataset import JsonlDataset, JsonlValidationDataset
+from blt.data.patcher import Patcher
+from blt.model.latent_transformer import ByteLatentTransformer, ByteLatentTransformerArgs
 from blt.model.common import get_num_flop_per_token
 from blt.model.entropy import EntropyModel
+from blt.tokenizer.blt_tokenizer import BLTTokenizer
 from blt.tokenizer.byte_tokenizer import ByteTokenizer
 from blt.utils.checkpoint import save_checkpoint
 from blt.utils.logging import init_wandb, log_metrics, log_model_summary, setup_logging
@@ -37,12 +40,14 @@ class TrainingState:
     scheduler: Any
     step: int
     scaler: Optional[GradScaler] = None
+    patcher: Optional[Patcher] = None
     total_loss_sum: float = 0.0
     total_loss_count: int = 0
     interval_bytes: int = 0
     global_bytes: int = 0
     start_time: float = 0.0
     last_log_time: float = 0.0
+    model_type: str = "entropy"
 
     @property
     def avg_loss(self) -> float:
@@ -65,26 +70,38 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def generate_text_sample(model, prompt, max_new_tokens, temperature, device):
+def generate_text_sample(state, tokenizer, prompt, max_new_tokens, temperature, device):
     """
     Generate tokens autoregressively. For the first 128 tokens generated,
     force continuation (i.e. ignore EOS) so that a sample is produced.
     """
+    model = state.model
     model.eval()
     if prompt.size(1) == 0:
-        prompt = pt.tensor([[257]], dtype=pt.long, device=device)
+        prompt = pt.tensor([[tokenizer.bos_id]], dtype=pt.long, device=device)
     generated = prompt.clone()
     forced_tokens = 128
+
     with pt.no_grad():
         for i in range(max_new_tokens):
-            logits = model(generated)
-            next_logits = logits[0, -1]
+            if state.model_type == "entropy":
+                logits = model(generated)
+                next_logits = logits[0, -1]
+            else:  # BLT model
+                # Create patches for BLT model
+                patch_lengths, _ = state.patcher.patch(generated)
+                logits = model(generated, patch_lengths=patch_lengths)
+                next_logits = logits[0, -1]
+
             scaled_logits = next_logits / temperature
             probabilities = pt.softmax(scaled_logits, dim=-1)
             next_token = pt.multinomial(probabilities, num_samples=1).unsqueeze(0)
             generated = pt.cat([generated, next_token], dim=1)
-            if i >= forced_tokens and next_token.item() == 258:
+
+            # Check for EOS token
+            if i >= forced_tokens and next_token.item() == tokenizer.eos_id:
                 break
+
     model.train()
     return generated
 
@@ -127,7 +144,7 @@ def get_validation_batch(val_iter, val_loader, device):
     return val_iter, val_input.to(device), val_target.to(device)
 
 
-def setup_training_state(config, model, device, total_steps, resume_path=None):
+def setup_training_state(config, model, device, total_steps, patcher=None, model_type="entropy", resume_path=None):
     """Initialize or resume training state."""
     optimizer = build_optimizer(model, config.optim)
     scheduler = get_cosine_schedule(
@@ -146,8 +163,10 @@ def setup_training_state(config, model, device, total_steps, resume_path=None):
         scheduler=scheduler,
         step=0,
         scaler=scaler,
+        patcher=patcher,
         start_time=time.time(),
         last_log_time=time.time(),
+        model_type=model_type,
     )
 
     if resume_path and os.path.isfile(resume_path):
@@ -217,7 +236,16 @@ def perform_training_step(state, input_seq, target_seq, config, device):
     # Use autocast for mixed precision training
     if use_amp:
         with autocast(device_type=device if device != "cpu" else None):
-            loss = state.model(input_seq, target_seq)
+            if state.model_type == "entropy":
+                logits = state.model(input_seq)
+            else:  # BLT model
+                # Create patches for BLT model
+                patch_lengths, _ = state.patcher.patch(input_seq)
+                logits = state.model(input_seq, patch_lengths=patch_lengths)
+                
+            loss = F.cross_entropy(
+                logits.view(-1, config.model.vocab_size), target_seq.view(-1)
+            )
 
         state.scaler.scale(loss).backward()
         state.scaler.unscale_(state.optimizer)
@@ -225,7 +253,16 @@ def perform_training_step(state, input_seq, target_seq, config, device):
         state.scaler.step(state.optimizer)
         state.scaler.update()
     else:
-        loss = state.model(input_seq, target_seq)
+        if state.model_type == "entropy":
+            logits = state.model(input_seq)
+        else:  # BLT model
+            # Create patches for BLT model
+            patch_lengths, _ = state.patcher.patch(input_seq)
+            logits = state.model(input_seq, patch_lengths=patch_lengths)
+            
+        loss = F.cross_entropy(
+            logits.view(-1, config.model.vocab_size), target_seq.view(-1)
+        )
         loss.backward()
         pt.nn.utils.clip_grad_norm_(state.model.parameters(), config.optim.clip)
         state.optimizer.step()
@@ -266,13 +303,25 @@ def validate_model(state, val_loader, device, config, tokenizer, val_table):
 
             if use_amp:
                 with autocast(device_type=device if device != "cpu" else None):
-                    val_logits = state.model(val_input)
+                    if state.model_type == "entropy":
+                        val_logits = state.model(val_input)
+                    else:  # BLT model
+                        # Create patches for BLT model
+                        patch_lengths, _ = state.patcher.patch(val_input)
+                        val_logits = state.model(val_input, patch_lengths=patch_lengths)
+                        
                     val_loss = F.cross_entropy(
                         val_logits.view(-1, config.model.vocab_size),
                         val_target.view(-1),
                     )
             else:
-                val_logits = state.model(val_input)
+                if state.model_type == "entropy":
+                    val_logits = state.model(val_input)
+                else:  # BLT model
+                    # Create patches for BLT model
+                    patch_lengths, _ = state.patcher.patch(val_input)
+                    val_logits = state.model(val_input, patch_lengths=patch_lengths)
+                    
                 val_loss = F.cross_entropy(
                     val_logits.view(-1, config.model.vocab_size),
                     val_target.view(-1),
@@ -289,7 +338,7 @@ def validate_model(state, val_loader, device, config, tokenizer, val_table):
     # Generate from BOS token only
     prompt_tokens = pt.tensor([[tokenizer.bos_id]], dtype=pt.long, device=device)
     gen_tokens = generate_text_sample(
-        state.model, prompt_tokens, max_new_tokens=256, temperature=1.0, device=device
+        state, tokenizer, prompt_tokens, max_new_tokens=256, temperature=1.0, device=device
     )
     response = tokenizer.decode(gen_tokens[0].tolist())
 
@@ -320,6 +369,8 @@ def train_model(
     total_steps,
     device,
     val_table,
+    patcher=None,
+    model_type="entropy",
 ):
     """Main training loop with modular components."""
     # Initialize training state
@@ -328,6 +379,8 @@ def train_model(
         model,
         device,
         total_steps,
+        patcher=patcher,
+        model_type=model_type,
         resume_path=(
             config.checkpoint.resume_from
             if hasattr(config.checkpoint, "resume_from")
@@ -434,37 +487,57 @@ def train_model(
 
 
 def calculate_total_steps(config, train_dataset):
-    """Calculate or retrieve cached total steps."""
+    """Calculate or retrieve cached total steps.
+    
+    The cache now stores a list of configurations and their associated total steps.
+    If any cached configuration matches the current one, it will use the cached total steps.
+    """
     steps_cache_file = os.path.join(config.dump_dir, "steps_cache.json")
-    cache_config = {
+    current_config = {
         "train_dir": config.data.train_dir,
         "seq_len": config.data.seq_len,
         "batch_size": config.data.batch_size,
     }
 
+    cache_entries = []
+
     if os.path.exists(steps_cache_file):
         with open(steps_cache_file, "r") as f:
-            cache = json.load(f)
-            if cache["config"] == cache_config:
-                total_steps = cache["total_steps"]
-                logger.info(f"Using cached total steps: {total_steps}")
-                return total_steps
-            else:
-                logger.info("Config changed, recalculating total steps...")
-    else:
-        logger.info("Calculating total steps for the first time...")
-
+            try:
+                cache_data = json.load(f)
+                if isinstance(cache_data, dict) and "config" in cache_data:
+                    # Old format - single entry
+                    cache_entries = [cache_data]
+                else:
+                    # New format - list of entries
+                    cache_entries = cache_data
+            except json.JSONDecodeError:
+                logger.warning(f"Could not parse cache file {steps_cache_file}, will recalculate steps")
+                cache_entries = []
+    
+    for entry in cache_entries:
+        if entry["config"] == current_config:
+            total_steps = entry["total_steps"]
+            logger.info(f"Using cached total steps: {total_steps}")
+            return total_steps
+    
+    logger.info("No matching configuration in cache, calculating total steps...")
     total_steps = train_dataset.calculate_total_steps(config.data.batch_size)
-    os.makedirs(config.dump_dir, exist_ok=True)
-    with open(steps_cache_file, "w") as f:
-        json.dump({"config": cache_config, "total_steps": total_steps}, f)
 
+    new_entry = {"config": current_config, "total_steps": total_steps}
+
+    cache_entries.append(new_entry)
+    os.makedirs(config.dump_dir, exist_ok=True)
+
+    with open(steps_cache_file, "w") as f:
+        json.dump(cache_entries, f)
+    
     return total_steps
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train BLT Entropy Model on JSONL dataset"
+        description="Train BLT Entropy Model or BLT Model on JSONL dataset"
     )
     parser.add_argument(
         "--config",
@@ -488,8 +561,6 @@ def main():
         device = args.device
     else:
         device = "cuda" if pt.cuda.is_available() else "cpu"
-
-    logger.info(f"Using device: {device}")
 
     # Load and merge configuration
     base_config = OmegaConf.load(args.config)
@@ -517,8 +588,22 @@ def main():
     # Set random seed
     seed_everything(config.seed)
 
-    # Initialize tokenizer
-    tokenizer = ByteTokenizer()
+    # Determine model type
+    model_type = getattr(config, "model_type", "entropy")
+    logger.info(f"Training model type: {model_type}")
+
+    # Initialize tokenizer and optional patcher based on model type
+    patcher = None
+    if model_type == "entropy":
+        tokenizer = ByteTokenizer()
+    else:  # BLT model
+        tokenizer = BLTTokenizer()
+        patcher = Patcher(
+            patch_size=config.model.patch_size,
+            patching_mode=config.model.patching_mode,
+            patching_threshold=config.model.get("patching_threshold", None),
+            max_patch_length=config.model.get("max_patch_length", None),
+        )
 
     # Create datasets
     train_dataset = JsonlDataset(
@@ -551,9 +636,53 @@ def main():
         val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=1
     )
 
-    # Create model
-    model = EntropyModel(config).to(device)
-    logger.info(f"Model: {model}")
+    # Create model based on model type
+    if model_type == "entropy":
+        model = EntropyModel(config).to(device)
+    else:  # BLT model
+        blt_args = ByteLatentTransformerArgs(
+            # Basic model configuration
+            vocab_size=config.model.vocab_size,
+            # Architecture and dimensions
+            dim_global=config.model.dim_global,
+            dim_local_encoder=config.model.dim_local_encoder,
+            dim_local_decoder=config.model.dim_local_decoder,
+            n_layers_global=config.model.n_layers_global,
+            n_layers_local_encoder=config.model.n_layers_local_encoder,
+            n_layers_local_decoder=config.model.n_layers_local_decoder,
+            # Tokenization and patching
+            patch_size=config.model.patch_size,
+            patching_mode=config.model.patching_mode,
+            patching_threshold=config.model.get("patching_threshold", None),
+            max_patch_length=config.model.get("max_patch_length", None),
+            # Encoder/Decoder configuration
+            max_encoder_seq_length=config.model.get("max_encoder_seq_length", 4096),
+            share_encoder_decoder_emb=config.model.get(
+                "share_encoder_decoder_emb", True
+            ),
+            # Cross attention configurations
+            cross_attn_encoder=config.model.get("cross_attn_encoder", False),
+            cross_attn_decoder=config.model.get("cross_attn_decoder", False),
+            cross_attn_k=config.model.get("cross_attn_k", None),
+            cross_attn_nheads=config.model.get("cross_attn_nheads", 4),
+            cross_attn_all_layers_decoder=config.model.get(
+                "cross_attn_all_layers_decoder", False
+            ),
+            cross_attn_all_layers_encoder=config.model.get(
+                "cross_attn_all_layers_encoder", False
+            ),
+            cross_attn_init_by_pooling=config.model.get(
+                "cross_attn_init_by_pooling", False
+            ),
+            # Model behavior and optimization
+            downsampling_by_pooling=config.model.get("downsampling_by_pooling", None),
+            use_rope=config.model.get("use_rope", True),
+            dropout=config.model.get("dropout", 0.0),
+            # Additional configurations
+            attn_impl=config.model.get("attn_impl", "sdpa"),
+        )
+        model = ByteLatentTransformer(blt_args).to(device)
+        model.init_weights()
 
     # Enable dynamo compilation if configured
     if getattr(config.optim, "enable_dynamo", False):
@@ -562,16 +691,28 @@ def main():
 
     # Log model summary
     log_model_summary(model)
+    logger.info(f"Model: {model}")
     param_count = count_parameters(model)
     logger.info(f"Model parameter count: {param_count}")
     wandb.run.summary["param_count"] = param_count
 
     # Log initial generation before training
     logger.info("Generating initial sample before training...")
+    
+    # Create a temporary state object for generation
+    temp_state = TrainingState(
+        model=model,
+        optimizer=None,
+        scheduler=None,
+        step=0,
+        model_type=model_type,
+        patcher=patcher,
+    )
+    
     model.eval()
     prompt_tokens = pt.tensor([[tokenizer.bos_id]], dtype=pt.long, device=device)
     gen_tokens = generate_text_sample(
-        model, prompt_tokens, max_new_tokens=256, temperature=1.0, device=device
+        temp_state, tokenizer, prompt_tokens, max_new_tokens=256, temperature=1.0, device=device
     )
     response = tokenizer.decode(gen_tokens[0].tolist())
 
@@ -592,6 +733,8 @@ def main():
         total_steps,
         device,
         val_table,
+        patcher=patcher,
+        model_type=model_type,
     )
 
     # Clean up
