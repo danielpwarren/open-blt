@@ -129,7 +129,7 @@ def init_wandb(config: Any, resume: bool = False) -> None:
         config=config_dict,
         name=getattr(config, "name", None),
         id=run_id,
-        resume="allow" if run_id is not None else None,
+        resume="allow",
     )
 
     logging.info(f"WandB initialized: {wandb.run.name}")

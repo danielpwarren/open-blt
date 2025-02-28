@@ -479,7 +479,7 @@ def main():
         "--device",
         type=str,
         default="",
-        help="Device to use (e.g., 'cuda', 'cpu', 'mps'). Empty string means auto-detect.",
+        help="Device to use (e.g., 'cuda', 'cpu'). Empty string means auto-detect.",
     )
     args = parser.parse_args()
 
